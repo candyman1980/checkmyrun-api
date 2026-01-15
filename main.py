@@ -131,10 +131,12 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
                 ],
             }
         ],
-        "text": {
+  "text": {
     "format": {
         "type": "json_schema",
-        "json_schema": response_schema
+        "name": response_schema["name"],
+        "schema": response_schema["schema"],
+        "strict": True
     }
 },
         "max_output_tokens": 500,
