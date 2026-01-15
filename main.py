@@ -14,7 +14,7 @@ app.add_middleware(
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "checkmyrun-api"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V1"}
 
 def read_image(upload: UploadFile) -> np.ndarray:
     data = upload.file.read()
