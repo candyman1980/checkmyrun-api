@@ -1,7 +1,12 @@
-from fastapi import FastAPI, File, UploadFile
+import os
+import json
+import base64
+import requests
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import numpy as np
-import cv2
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")  # can set to gpt-4o-mini for cheaper tests
 
 app = FastAPI()
 
@@ -14,90 +19,142 @@ app.add_middleware(
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V1"}
+    # This will prove you’re on the OpenAI version when you refresh / after deploy
+    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V2", "model": MODEL}
 
-def read_image(upload: UploadFile) -> np.ndarray:
-    data = upload.file.read()
-    arr = np.frombuffer(data, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Could not decode image")
-    return img
+def to_data_url(upload: UploadFile) -> str:
+    b = upload.file.read()
+    if not b:
+        raise ValueError("Empty upload")
 
-def wear_bias_from_image(img_bgr: np.ndarray):
-    h, w = img_bgr.shape[:2]
-    scale = 800 / max(h, w)
-    if scale < 1:
-        img_bgr = cv2.resize(img_bgr, (int(w*scale), int(h*scale)))
-
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Make the sole white
-    if np.mean(th) > 127:
-        th = 255 - th
-
-    kernel = np.ones((9, 9), np.uint8)
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return {"bias": "unknown", "confidence": 0.0}
-
-    c = max(cnts, key=cv2.contourArea)
-    if cv2.contourArea(c) < 5000:
-        return {"bias": "unknown", "confidence": 0.0}
-
-    mask = np.zeros_like(gray)
-    cv2.drawContours(mask, [c], -1, 255, -1)
-
-    lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
-    tex = np.abs(lap)
-
-    tex_masked = tex[mask == 255]
-    p95 = np.percentile(tex_masked, 95) if tex_masked.size else 1.0
-    tex_norm = np.clip(tex / (p95 + 1e-6), 0, 1)
-
-    wear_map = 1.0 - tex_norm  # higher = smoother = more worn (proxy)
-
-    H, W = wear_map.shape[:2]
-    left_half = wear_map[:, :W//2]
-    right_half = wear_map[:, W//2:]
-    left_mask = mask[:, :W//2]
-    right_mask = mask[:, W//2:]
-
-    def mean_wear(half, half_mask):
-        vals = half[half_mask == 255]
-        return float(np.mean(vals)) if vals.size else 0.0
-
-    wear_L = mean_wear(left_half, left_mask)
-    wear_R = mean_wear(right_half, right_mask)
-
-    ratio = (wear_L + 1e-6) / (wear_R + 1e-6)
-
-    if ratio > 1.12:
-        bias = "left-side heavier wear"
-    elif ratio < 0.88:
-        bias = "right-side heavier wear"
+    name = (upload.filename or "").lower()
+    if name.endswith(".png"):
+        mime = "image/png"
     else:
-        bias = "balanced wear"
+        mime = "image/jpeg"
 
-    confidence = float(min(abs(np.log(ratio)) / 0.5, 1.0))
-    return {"bias": bias, "confidence": round(confidence, 2), "details": {"wear_left": round(wear_L, 3), "wear_right": round(wear_R, 3), "ratio": round(ratio, 3)}}
+    b64 = base64.b64encode(b).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+def extract_output_text(resp_json: dict) -> str:
+    out = []
+    for item in resp_json.get("output", []):
+        for part in item.get("content", []):
+            if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                out.append(part["text"])
+    return "\n".join(out).strip()
 
 @app.post("/analyze")
 async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
-    left_img = read_image(left)
-    right_img = read_image(right)
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in Render env vars for this service")
 
-    left_res = wear_bias_from_image(left_img)
-    right_res = wear_bias_from_image(right_img)
+    try:
+        left_url = to_data_url(left)
+        right_url = to_data_url(right)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
-    return {
-        "left": left_res,
-        "right": right_res,
-        "note": "Prototype wear-pattern proxy. For best results: bright light, camera straight above, minimal shadows."
+    # Strict JSON schema response
+    response_schema = {
+        "name": "checkmyrun_pronation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "left": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "notes": {"type": "string"},
+                    },
+                    "required": ["pronation", "confidence", "notes"],
+                },
+                "right": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "notes": {"type": "string"},
+                    },
+                    "required": ["pronation", "confidence", "notes"],
+                },
+                "overall": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "shoe_category": {"type": "string", "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                    "required": ["pronation", "shoe_category", "confidence"],
+                },
+                "photo_quality": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "issues": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["ok", "issues"],
+                },
+            },
+            "required": ["left", "right", "overall", "photo_quality"],
+        },
     }
+
+    instruction = (
+        "You are a running shoe fitting assistant.\n"
+        "You will be given two outsole (sole) photos: LEFT and RIGHT shoe.\n"
+        "Infer pronation style from wear patterns.\n"
+        "Be conservative: if wear is unclear, output 'unclear' with low confidence.\n"
+        "No medical advice. Notes must be short (1–2 sentences).\n"
+        "Also assess photo quality and list issues.\n"
+        "Return ONLY valid JSON matching the schema.\n"
+    )
+
+    payload = {
+        "model": MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": instruction},
+                    {"type": "input_text", "text": "LEFT SOLE:"},
+                    {"type": "input_image", "image_url": left_url},
+                    {"type": "input_text", "text": "RIGHT SOLE:"},
+                    {"type": "input_image", "image_url": right_url},
+                ],
+            }
+        ],
+        "response_format": {"type": "json_schema", "json_schema": response_schema},
+        "max_output_tokens": 500,
+    }
+
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=90,
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI request failed: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"OpenAI error {r.status_code}: {r.text}")
+
+    resp_json = r.json()
+    text = extract_output_text(resp_json)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"error": "Model returned non-JSON unexpectedly", "raw": text}
