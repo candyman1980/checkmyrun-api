@@ -130,12 +130,14 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...), r
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": instruction},
-                    {"type": "input_text", "text": "LEFT SOLE:"},
-                    {"type": "input_image", "image_url": left_url},
-                    {"type": "input_text", "text": "RIGHT SOLE:"},
-                    {"type": "input_image", "image_url": right_url},
-                ],
+    {"type": "input_text", "text": instruction},
+    {"type": "input_text", "text": "LEFT SOLE:"},
+    {"type": "input_image", "image_url": left_url},
+    {"type": "input_text", "text": "RIGHT SOLE:"},
+    {"type": "input_image", "image_url": right_url},
+    {"type": "input_text", "text": "REAR HEEL VIEW (BOTH SHOES IN ONE PHOTO):"},
+    {"type": "input_image", "image_url": rear_url},
+],
             }
         ],
   "text": {
