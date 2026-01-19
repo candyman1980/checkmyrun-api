@@ -108,18 +108,20 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...), r
         },
     }
 
-    instruction = (
+ instruction = (
   "You are a running shoe fitting assistant.\n"
-  "You will be given two outsole photos: LEFT and RIGHT shoe.\n\n"
+  "You will be given two outsole photos: LEFT and RIGHT shoe, plus a rear heel photo showing both shoes.\n\n"
   "Task:\n"
   "1) Identify visible wear hotspots (heel: lateral/central/medial; forefoot: lateral/central/medial; toe-off).\n"
-  "2) Infer likely gait category from wear patterns: overpronation / underpronation / neutral / unclear.\n"
+  "2) Infer likely gait category from wear patterns and heel alignment: overpronation / underpronation / neutral / unclear.\n"
   "3) Recommend shoe category: stability / neutral / cushioned-neutral / unclear.\n\n"
   "Rules:\n"
   "- Base your decision ONLY on what is visible in the photos.\n"
-  "- If the outsole is too new, too dirty, too blurry, heavily shadowed, or angle is poor, output 'unclear' and list issues.\n"
+  "- Use the rear heel photo (both shoes) to assess heel alignment, inward collapse indicators, and left-right asymmetry.\n"
+  "- If the rear heel photo is unclear, mention that explicitly in photo_quality.issues.\n"
+  "- If the outsole is too new, dirty, blurry, heavily shadowed, or angle is poor, output 'unclear' and list issues.\n"
   "- If left and right differ, reflect that and set overall to the more supportive recommendation.\n"
-  "- Keep notes concise and specific (mention the observed wear area(s)).\n"
+  "- Keep notes concise and specific (mention observed wear areas or heel alignment).\n"
   "- This is informational only; no medical claims.\n"
   "Return ONLY valid JSON matching the schema."
 )
