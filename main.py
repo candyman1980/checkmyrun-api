@@ -45,7 +45,7 @@ def extract_output_text(resp_json: dict) -> str:
     return "\n".join(out).strip()
 
 @app.post("/analyze")
-async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
+async def analyze(left: UploadFile = File(...), right: UploadFile = File(...), rear: UploadFile = File(...)):
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in Render env vars for this service")
 
