@@ -52,6 +52,7 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...), r
     try:
         left_url = to_data_url(left)
         right_url = to_data_url(right)
+        rear_url = to_data_url(rear)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
