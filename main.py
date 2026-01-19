@@ -49,7 +49,7 @@ def extract_output_text(resp_json: dict) -> str:
     return "\n".join(out).strip()
 
 RESPONSE_SCHEMA = {
-    "name": "checkmyrun_pronation",
+    "name": "checkmyrun_pronation_v2",
     "strict": True,
     "schema": {
         "type": "object",
@@ -60,20 +60,32 @@ RESPONSE_SCHEMA = {
                 "additionalProperties": False,
                 "properties": {
                     "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "wear_hotspots": {"type": "array", "items": {"type": "string"}},
                     "notes": {"type": "string"},
                 },
-                "required": ["pronation", "confidence", "notes"],
+                "required": ["pronation", "certainty", "wear_hotspots", "notes"],
             },
             "right": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
                     "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "wear_hotspots": {"type": "array", "items": {"type": "string"}},
                     "notes": {"type": "string"},
                 },
-                "required": ["pronation", "confidence", "notes"],
+                "required": ["pronation", "certainty", "wear_hotspots", "notes"],
+            },
+            "rear_heel": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "alignment": {"type": "string", "enum": ["neutral", "inward_collapse", "outward_roll", "unclear"]},
+                    "asymmetry": {"type": "string", "enum": ["none", "left_more", "right_more", "unclear"]},
+                    "notes": {"type": "string"},
+                },
+                "required": ["alignment", "asymmetry", "notes"],
             },
             "overall": {
                 "type": "object",
@@ -81,9 +93,10 @@ RESPONSE_SCHEMA = {
                 "properties": {
                     "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
                     "shoe_category": {"type": "string", "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "why": {"type": "string"},
                 },
-                "required": ["pronation", "shoe_category", "confidence"],
+                "required": ["pronation", "shoe_category", "certainty", "why"],
             },
             "photo_quality": {
                 "type": "object",
@@ -91,11 +104,12 @@ RESPONSE_SCHEMA = {
                 "properties": {
                     "ok": {"type": "boolean"},
                     "issues": {"type": "array", "items": {"type": "string"}},
+                    "retake_tips": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["ok", "issues"],
+                "required": ["ok", "issues", "retake_tips"],
             },
         },
-        "required": ["left", "right", "overall", "photo_quality"],
+        "required": ["left", "right", "rear_heel", "overall", "photo_quality"],
     },
 }
 
@@ -104,20 +118,19 @@ INSTRUCTION = (
     "You will be given three photos:\n"
     "1) LEFT outsole\n"
     "2) RIGHT outsole\n"
-    "3) A rear heel view showing BOTH shoes side-by-side\n\n"
-    "Task:\n"
-    "1) Identify visible wear hotspots (heel: lateral/central/medial; forefoot: lateral/central/medial; toe-off).\n"
-    "2) Use outsole wear + rear heel alignment to infer gait category: overpronation / underpronation / neutral / unclear.\n"
-    "3) Recommend shoe category: stability / neutral / cushioned-neutral / unclear.\n\n"
+    "3) Rear heel view showing BOTH shoes\n\n"
+    "Goal: Provide a best-effort pronation/gait indication for each shoe and an overall recommendation.\n\n"
+    "How to reason:\n"
+    "- Primary signal: outsole wear distribution (medial vs lateral heel, midfoot scuffing, toe-off zone).\n"
+    "- Secondary signal: rear heel alignment (inward collapse/eversion vs neutral vs outward roll) and left/right asymmetry.\n"
+    "- If signals conflict, choose the more conservative/supportive shoe category and explain why.\n\n"
     "Rules:\n"
     "- Base decisions ONLY on what is visible.\n"
-    "- Rear heel photo is helpful for heel alignment / inward collapse / asymmetry, BUT it should NOT invalidate outsole evidence.\n"
-    "- If rear heel photo is unclear, add an issue in photo_quality.issues and proceed using outsole evidence.\n"
-    "- Only output 'unclear' when the photos genuinely do not show enough to make a reasonable inference.\n"
-    "- If photos are imperfect, still make the most likely inference and list the issues.\n"
-    "- If left and right differ, reflect that; set overall to the more supportive recommendation.\n"
-    "- Keep notes concise and specific (mention observed wear areas and/or heel alignment cues).\n"
-    "- Informational only; no medical claims.\n"
+    "- Rear heel photo is REQUIRED input, but if it is unclear, do NOT automatically return 'unclear' overall.\n"
+    "- Only use 'unclear' when you truly cannot infer a likely category from the visible evidence.\n"
+    "- Always list photo issues if present (blur, shadows, angle, too new/too dirty, cropped heel, not both shoes in rear view).\n"
+    "- Write notes in plain English. Avoid medical claims.\n"
+    "- Use certainty levels: high / medium / low (no numeric percentages).\n"
     "Return ONLY valid JSON matching the schema."
 )
 
