@@ -159,7 +159,7 @@ def call_openai(left_url: str, right_url: str, rear_url: str) -> dict:
                 "strict": True,
             }
         },
-        "max_output_tokens": 700,
+        "max_output_tokens": 900,
     }
 
     try:
