@@ -108,14 +108,20 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
     }
 
     instruction = (
-        "You are a running shoe fitting assistant.\n"
-        "You will be given two outsole (sole) photos: LEFT and RIGHT shoe.\n"
-        "Infer pronation style from wear patterns.\n"
-        "Be conservative: if wear is unclear, output 'unclear' with low confidence.\n"
-        "No medical advice. Notes must be short (1–2 sentences).\n"
-        "Also assess photo quality and list issues.\n"
-        "Return ONLY valid JSON matching the schema.\n"
-    )
+  "You are a running shoe fitting assistant.\n"
+  "You will be given two outsole photos: LEFT and RIGHT shoe.\n\n"
+  "Task:\n"
+  "1) Identify visible wear hotspots (heel: lateral/central/medial; forefoot: lateral/central/medial; toe-off).\n"
+  "2) Infer likely gait category from wear patterns: overpronation / underpronation / neutral / unclear.\n"
+  "3) Recommend shoe category: stability / neutral / cushioned-neutral / unclear.\n\n"
+  "Rules:\n"
+  "- Base your decision ONLY on what is visible in the photos.\n"
+  "- If the outsole is too new, too dirty, too blurry, heavily shadowed, or angle is poor, output 'unclear' and list issues.\n"
+  "- If left and right differ, reflect that and set overall to the more supportive recommendation.\n"
+  "- Keep notes concise and specific (mention the observed wear area(s)).\n"
+  "- This is informational only; no medical claims.\n"
+  "Return ONLY valid JSON matching the schema."
+)
 
     payload = {
         "model": MODEL,
