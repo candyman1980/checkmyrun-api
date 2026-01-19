@@ -57,7 +57,7 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...), r
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
     # Strict JSON schema response
-    response_schema = {
+response_schema = {
         "name": "checkmyrun_pronation",
         "strict": True,
         "schema": {
@@ -108,7 +108,7 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...), r
         },
     }
 
- instruction = (
+instruction = (
   "You are a running shoe fitting assistant.\n"
   "You will be given two outsole photos: LEFT and RIGHT shoe, plus a rear heel photo showing both shoes.\n\n"
   "Task:\n"
