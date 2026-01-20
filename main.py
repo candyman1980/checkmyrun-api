@@ -2,43 +2,40 @@ import os
 import json
 import base64
 import requests
+from typing import List, Dict, Any
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
-DEBUG_UPLOADS = os.getenv("DEBUG_UPLOADS") == "1"
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # cheaper default for testing
+DEBUG_UPLOADS = os.environ.get("DEBUG_UPLOADS", "0") in ("1", "true", "True", "yes", "YES")
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://checkmyrun.com",
-        "https://www.checkmyrun.com",
-        "http://checkmyrun.com",
-        "*",
-    ],
+    allow_origins=["https://checkmyrun.com", "https://www.checkmyrun.com", "http://checkmyrun.com", "*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V3", "model": MODEL}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V3-HEATMAP", "model": MODEL}
 
-def file_to_data_url_and_bytes(upload: UploadFile, label: str):
+def to_data_url(upload: UploadFile) -> str:
     b = upload.file.read()
     if not b:
-        raise ValueError(f"Empty upload for {label}")
+        raise ValueError("Empty upload")
 
     if DEBUG_UPLOADS:
-        print(f"DEBUG_UPLOADS: {label} filename={upload.filename} size={len(b)} bytes")
+        print(f"DEBUG_UPLOADS: filename={upload.filename} size={len(b)} bytes")
 
     name = (upload.filename or "").lower()
     mime = "image/png" if name.endswith(".png") else "image/jpeg"
     b64 = base64.b64encode(b).decode("utf-8")
-    return f"data:{mime};base64,{b64}", len(b)
+    return f"data:{mime};base64,{b64}"
 
 def extract_output_text(resp_json: dict) -> str:
     out = []
@@ -48,55 +45,50 @@ def extract_output_text(resp_json: dict) -> str:
                 out.append(part["text"])
     return "\n".join(out).strip()
 
-RESPONSE_SCHEMA = {
-    "name": "checkmyrun_pronation_v2",
+# ---------- OpenAI JSON schema (strict) ----------
+heat_point_schema: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "x": {"type": "number", "minimum": 0, "maximum": 1, "description": "0..1 across the image width"},
+        "y": {"type": "number", "minimum": 0, "maximum": 1, "description": "0..1 down the image height"},
+        "radius": {"type": "number", "minimum": 0.03, "maximum": 0.6, "description": "0..1 relative radius (use 0.10–0.25 typically)"},
+        "intensity": {"type": "number", "minimum": 0.1, "maximum": 1, "description": "relative heat strength"},
+        "label": {"type": "string", "description": "short label e.g. 'lateral heel'"},
+    },
+    "required": ["x", "y", "radius", "intensity", "label"],
+}
+
+side_schema: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+        "notes": {"type": "string"},
+        "heatmap": {"type": "array", "items": heat_point_schema, "maxItems": 6},
+    },
+    "required": ["pronation", "notes", "heatmap"],
+}
+
+response_schema = {
+    "name": "checkmyrun_pronation_heatmap",
     "strict": True,
     "schema": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "left": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
-                    "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
-                    "wear_hotspots": {"type": "array", "items": {"type": "string"}},
-                    "notes": {"type": "string"},
-                },
-                "required": ["pronation", "certainty", "wear_hotspots", "notes"],
-            },
-            "right": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
-                    "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
-                    "wear_hotspots": {"type": "array", "items": {"type": "string"}},
-                    "notes": {"type": "string"},
-                },
-                "required": ["pronation", "certainty", "wear_hotspots", "notes"],
-            },
-            "rear_heel": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "alignment": {"type": "string", "enum": ["neutral", "inward_collapse", "outward_roll", "unclear"]},
-                    "asymmetry": {"type": "string", "enum": ["none", "left_more", "right_more", "unclear"]},
-                    "notes": {"type": "string"},
-                },
-                "required": ["alignment", "asymmetry", "notes"],
-            },
+            "left": side_schema,
+            "right": side_schema,
             "overall": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
                     "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
                     "shoe_category": {"type": "string", "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]},
-                    "certainty": {"type": "string", "enum": ["high", "medium", "low"]},
-                    "why": {"type": "string"},
+                    "summary": {"type": "string", "description": "1–2 sentence human-friendly outcome"},
+                    "why_these_shoes": {"type": "string", "description": "Short explanation for the category"},
                 },
-                "required": ["pronation", "shoe_category", "certainty", "why"],
+                "required": ["pronation", "shoe_category", "summary", "why_these_shoes"],
             },
             "photo_quality": {
                 "type": "object",
@@ -104,44 +96,56 @@ RESPONSE_SCHEMA = {
                 "properties": {
                     "ok": {"type": "boolean"},
                     "issues": {"type": "array", "items": {"type": "string"}},
-                    "retake_tips": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["ok", "issues", "retake_tips"],
+                "required": ["ok", "issues"],
             },
         },
-        "required": ["left", "right", "rear_heel", "overall", "photo_quality"],
+        "required": ["left", "right", "overall", "photo_quality"],
     },
 }
 
-INSTRUCTION = (
+instruction = (
     "You are a running shoe fitting assistant.\n"
-    "You will be given three photos:\n"
-    "1) LEFT outsole\n"
-    "2) RIGHT outsole\n"
-    "3) Rear heel view showing BOTH shoes\n\n"
-    "Goal: Provide a best-effort pronation/gait indication for each shoe and an overall recommendation.\n\n"
-    "How to reason:\n"
-    "- Primary signal: outsole wear distribution (medial vs lateral heel, midfoot scuffing, toe-off zone).\n"
-    "- Secondary signal: rear heel alignment (inward collapse/eversion vs neutral vs outward roll) and left/right asymmetry.\n"
-    "- If signals conflict, choose the more conservative/supportive shoe category and explain why.\n\n"
-    "Rules:\n"
+    "You will be given three photos: LEFT outsole, RIGHT outsole, and a REAR heel view showing both shoes.\n\n"
+    "Tasks:\n"
+    "1) Identify visible wear hotspots on each outsole (heel: lateral/central/medial; forefoot: lateral/central/medial; toe-off).\n"
+    "2) Use outsole wear + the rear heel view (heel alignment / inward collapse indicators / left-right asymmetry) to infer: "
+    "overpronation / underpronation / neutral / unclear.\n"
+    "3) Recommend shoe category: stability / neutral / cushioned-neutral / unclear.\n"
+    "4) Provide a 'heatmap' for EACH outsole: return 2–6 heat points where wear is most visible.\n\n"
+    "Heatmap rules:\n"
+    "- Each heat point must include x,y,radius,intensity,label.\n"
+    "- x,y are 0..1 relative to the outsole image (0,0 top-left; 1,1 bottom-right).\n"
+    "- radius is 0..1 (use ~0.10–0.25 typically).\n"
+    "- intensity is 0.1..1 (stronger wear = higher intensity).\n"
+    "- Only place heat points where wear is actually visible.\n\n"
+    "Quality rules:\n"
     "- Base decisions ONLY on what is visible.\n"
-    "- Rear heel photo is REQUIRED input, but if it is unclear, do NOT automatically return 'unclear' overall.\n"
-    "- Only use 'unclear' when you truly cannot infer a likely category from the visible evidence.\n"
-    "- Always list photo issues if present (blur, shadows, angle, too new/too dirty, cropped heel, not both shoes in rear view).\n"
-    "- Write notes in plain English. Avoid medical claims.\n"
-    "- Use certainty levels: high / medium / low (no numeric percentages).\n"
-    "Return ONLY valid JSON matching the schema."
+    "- If photos are too new, dirty, blurry, shadowed, or angled badly: set pronation 'unclear' and list issues.\n"
+    "- If the rear heel photo is unclear, mention it in photo_quality.issues.\n"
+    "- Keep notes concise and specific.\n"
+    "- Informational only; no medical claims.\n\n"
+    "Return ONLY valid JSON matching the provided schema.\n"
 )
 
-def call_openai(left_url: str, right_url: str, rear_url: str) -> dict:
+def _do_analyze(left: UploadFile, right: UploadFile, rear: UploadFile):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in Render env vars for this service")
+
+    try:
+        left_url = to_data_url(left)
+        right_url = to_data_url(right)
+        rear_url = to_data_url(rear)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
+
     payload = {
         "model": MODEL,
         "input": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": INSTRUCTION},
+                    {"type": "input_text", "text": instruction},
                     {"type": "input_text", "text": "LEFT OUTSOLE:"},
                     {"type": "input_image", "image_url": left_url},
                     {"type": "input_text", "text": "RIGHT OUTSOLE:"},
@@ -154,12 +158,12 @@ def call_openai(left_url: str, right_url: str, rear_url: str) -> dict:
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": RESPONSE_SCHEMA["name"],
-                "schema": RESPONSE_SCHEMA["schema"],
+                "name": response_schema["name"],
+                "schema": response_schema["schema"],
                 "strict": True,
             }
         },
-        "max_output_tokens": 900,
+        "max_output_tokens": 700,
     }
 
     try:
@@ -186,34 +190,11 @@ def call_openai(left_url: str, right_url: str, rear_url: str) -> dict:
     except json.JSONDecodeError:
         return {"error": "Model returned non-JSON unexpectedly", "raw": text}
 
-async def run_analysis(left: UploadFile, right: UploadFile, rear: UploadFile) -> dict:
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in Render env vars for this service")
-
-    try:
-        left_url, left_bytes = file_to_data_url_and_bytes(left, "LEFT")
-        right_url, right_bytes = file_to_data_url_and_bytes(right, "RIGHT")
-        rear_url, rear_bytes = file_to_data_url_and_bytes(rear, "REAR")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
-
-    # If DEBUG_UPLOADS=1, do not call OpenAI — just prove uploads arrived.
-    if DEBUG_UPLOADS:
-        return {
-            "debug": {
-                "model": MODEL,
-                "left": {"filename": left.filename, "bytes": left_bytes},
-                "right": {"filename": right.filename, "bytes": right_bytes},
-                "rear": {"filename": rear.filename, "bytes": rear_bytes},
-            }
-        }
-
-    return call_openai(left_url, right_url, rear_url)
-
-@app.post("/analyse")
-async def analyse(left: UploadFile = File(...), right: UploadFile = File(...), rear: UploadFile = File(...)):
-    return await run_analysis(left, right, rear)
-
 @app.post("/analyze")
 async def analyze(left: UploadFile = File(...), right: UploadFile = File(...), rear: UploadFile = File(...)):
-    return await run_analysis(left, right, rear)
+    return _do_analyze(left, right, rear)
+
+# UK spelling alias (optional but nice)
+@app.post("/analyse")
+async def analyse(left: UploadFile = File(...), right: UploadFile = File(...), rear: UploadFile = File(...)):
+    return _do_analyze(left, right, rear)
