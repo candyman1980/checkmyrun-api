@@ -4,4 +4,4 @@ requests==2.32.3
 python-multipart==0.0.9
 numpy==2.1.2
 opencv-python-headless==4.10.0.84
-Pillow
+Pillow==10.4.0
