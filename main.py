@@ -3,15 +3,14 @@ import os
 import json
 import base64
 import io
-import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # ---- OpenAI (new SDK) ----
-# requirements.txt must include: openai>=1.0.0
+# requirements.txt must include: openai==1.x and httpx pinned (e.g. httpx==0.27.2)
 from openai import OpenAI
 
 # ---- Pillow for heatmap overlays ----
@@ -21,9 +20,7 @@ from PIL import Image, ImageDraw, ImageFilter
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-app = FastAPI(title="CheckMyRun API", version="2.0")
+app = FastAPI(title="CheckMyRun API", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +33,6 @@ app.add_middleware(
 # -------------------------------------------------------------------
 # JSON schema for INTERNAL STRUCTURE (we don't show this raw in the UI)
 # -------------------------------------------------------------------
-
 PRONATION_SCHEMA: Dict[str, Any] = {
     "name": "checkmyrun_pronation_heatmap_v2",
     "schema": {
@@ -44,10 +40,8 @@ PRONATION_SCHEMA: Dict[str, Any] = {
         "additionalProperties": False,
         "properties": {
             "ok": {"type": "boolean"},
-
             "has_left_visual": {"type": "boolean"},
             "has_right_visual": {"type": "boolean"},
-
             "left_poly_points": {
                 "type": ["array", "null"],
                 "items": {"type": "array", "items": {"type": "number"}},
@@ -56,7 +50,6 @@ PRONATION_SCHEMA: Dict[str, Any] = {
                 "type": ["array", "null"],
                 "items": {"type": "array", "items": {"type": "number"}},
             },
-
             "left_heat_points": {
                 "type": ["array", "null"],
                 "items": {
@@ -83,13 +76,10 @@ PRONATION_SCHEMA: Dict[str, Any] = {
                     "required": ["x", "y", "intensity"],
                 },
             },
-
             # User-facing text (what you WANT the UI to show)
             "analysis_text": {"type": "string"},
-
             # 0..1: how confident the model feels about any left/right bias (not "medical certainty")
             "confidence": {"type": "number"},
-
             # Extra short notes
             "notes": {"type": ["string", "null"]},
         },
@@ -108,11 +98,9 @@ PRONATION_SCHEMA: Dict[str, Any] = {
     },
 }
 
-
 # --------------------------
 # Helpers
 # --------------------------
-
 def _default_payload(error: str) -> Dict[str, Any]:
     return {
         "ok": False,
@@ -161,11 +149,12 @@ def _extract_structured_json(resp: Any) -> Dict[str, Any]:
 
 def _clamp01(x: float) -> float:
     try:
+        x = float(x)
         if x < 0:
             return 0.0
         if x > 1:
             return 1.0
-        return float(x)
+        return x
     except Exception:
         return 0.0
 
@@ -192,7 +181,6 @@ def _make_overlay_png(
 
     # 1) Heat points as soft blobs (red-ish), intensity controls alpha
     if heat_points:
-        # Paint blobs on a separate layer then blur it
         blobs = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         bdraw = ImageDraw.Draw(blobs, "RGBA")
 
@@ -200,13 +188,12 @@ def _make_overlay_png(
             try:
                 x = float(p.get("x", 0))
                 y = float(p.get("y", 0))
-                inten = _clamp01(float(p.get("intensity", 0.2)))
+                inten = _clamp01(p.get("intensity", 0.2))
             except Exception:
                 continue
 
             r = point_radius
             a = int(overall_alpha * (0.25 + 0.75 * inten))  # never invisible
-            # Red/orange blob
             bdraw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 60, 0, a))
 
         blobs = blobs.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -217,9 +204,7 @@ def _make_overlay_png(
         try:
             pts = [(float(x), float(y)) for x, y in poly_points if isinstance(x, (int, float)) and isinstance(y, (int, float))]
             if len(pts) >= 3:
-                # faint fill
                 draw.polygon(pts, fill=(0, 255, 140, 60))
-                # outline
                 draw.line(pts + [pts[0]], fill=(0, 255, 140, 180), width=4)
         except Exception:
             pass
@@ -232,6 +217,16 @@ def _make_overlay_png(
     return f"data:image/png;base64,{out_b64}"
 
 
+def _get_openai_client() -> OpenAI:
+    """
+    IMPORTANT: Lazy client creation so the app can always boot (/health etc.)
+    even if OpenAI deps/env are temporarily broken.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set on the server.")
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
 async def _analyse_impl(left: UploadFile = None, right: UploadFile = None, rear: UploadFile = None):
     left_bytes = await left.read() if left else None
     right_bytes = await right.read() if right else None
@@ -239,9 +234,6 @@ async def _analyse_impl(left: UploadFile = None, right: UploadFile = None, rear:
 
     if not left_bytes and not right_bytes and not rear_bytes:
         return JSONResponse(_default_payload("No images provided."), status_code=200)
-
-    if client is None:
-        return JSONResponse(_default_payload("OPENAI_API_KEY not set on the server."), status_code=200)
 
     left_url = _file_to_data_url(left_bytes, left.filename) if left_bytes else None
     right_url = _file_to_data_url(right_bytes, right.filename) if right_bytes else None
@@ -281,6 +273,8 @@ async def _analyse_impl(left: UploadFile = None, right: UploadFile = None, rear:
         content.append({"type": "input_image", "image_url": rear_url})
 
     try:
+        client = _get_openai_client()
+
         resp = client.responses.create(
             model=OPENAI_MODEL,
             input=[{"role": "user", "content": content}],
@@ -301,7 +295,7 @@ async def _analyse_impl(left: UploadFile = None, right: UploadFile = None, rear:
             data["has_right_visual"] = True
 
         data["ok"] = True
-        data["confidence"] = _clamp01(float(data.get("confidence", 0.35)))
+        data["confidence"] = _clamp01(data.get("confidence", 0.35))
 
         # Generate overlays (what your UI should show)
         left_overlay = _make_overlay_png(left_bytes, data.get("left_poly_points"), data.get("left_heat_points")) if left_bytes else None
@@ -332,14 +326,30 @@ async def _analyse_impl(left: UploadFile = None, right: UploadFile = None, rear:
 
 
 # --------------------------
-# Routes (aliases to avoid 404s)
+# Routes
 # --------------------------
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "checkmyrun-api",
+        "message": "API is running. Use /health or POST images to /api/analyse (multipart/form-data).",
+        "endpoints": {
+            "health": "/health",
+            "analyse": ["/api/analyse", "/analyse", "/api/analyze", "/analyze"],
+        },
+    }
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
+# --------------------------
+# Analyse endpoints (aliases to avoid 404s)
+# --------------------------
 @app.post("/api/analyse")
 async def analyse_api(
     left: UploadFile = File(None),
