@@ -1,47 +1,84 @@
-# add near the other routes in main.py
-import sys
-import importlib
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+import base64
 
-@app.get("/_diag_openai")
-def diag_openai():
-    info = {"python_version": sys.version, "OPENAI_API_KEY_set": bool(OPENAI_API_KEY)}
+# ------------------------
+# CREATE APP FIRST (CRITICAL)
+# ------------------------
+app = FastAPI(title="CheckMyRun API")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------
+# BASIC ROUTES
+# ------------------------
+
+@app.get("/")
+def home():
+    return {
+        "ok": True,
+        "service": "checkmyrun-api",
+        "message": "API is running. Use /health or POST images to /api/analyse",
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ------------------------
+# HELPER
+# ------------------------
+
+def to_data_url(file_bytes: bytes, filename: str):
+    if not file_bytes:
+        return None
+    mime = "image/jpeg"
+    if filename.lower().endswith(".png"):
+        mime = "image/png"
+    encoded = base64.b64encode(file_bytes).decode()
+    return f"data:{mime};base64,{encoded}"
+
+
+# ------------------------
+# ANALYSIS ENDPOINT (SAFE MODE)
+# ------------------------
+
+@app.post("/api/analyse")
+async def analyse(
+    left: Optional[UploadFile] = File(None),
+    right: Optional[UploadFile] = File(None),
+    rear: Optional[UploadFile] = File(None),
+):
     try:
-        # real installed package version (if importable)
-        import openai as _openai_pkg
-        info["openai_installed_version"] = getattr(_openai_pkg, "__version__", "unknown")
+        left_bytes = await left.read() if left else None
+        right_bytes = await right.read() if right else None
+        rear_bytes = await rear.read() if rear else None
+
+        if not left_bytes and not right_bytes:
+            return {"ok": False, "analysis_text": "No images uploaded", "confidence": 0}
+
+        return JSONResponse({
+            "ok": True,
+            "analysis_text": "Server recovered successfully. AI analysis temporarily disabled.",
+            "confidence": 0.25,
+            "left_overlay_data_url": to_data_url(left_bytes, left.filename) if left else None,
+            "right_overlay_data_url": to_data_url(right_bytes, right.filename) if right else None,
+            "notes": "Recovery mode"
+        })
+
     except Exception as e:
-        info["openai_import_error"] = str(e)
-        return info
-
-    # Inspect the SDK class you've been using
-    try:
-        # try to construct the client object if possible (do NOT call remote)
-        ClientClass = getattr(_openai_pkg, "OpenAI", None)
-        info["client_class_present"] = ClientClass is not None
-        if ClientClass:
-            client_dir = dir(ClientClass())
-            info["client_dir_sample"] = [n for n in client_dir if n in ("responses", "chat", "completions")][:10]
-            info["has_responses"] = "responses" in client_dir
-        else:
-            info["client_dir_sample"] = []
-            info["has_responses"] = False
-    except Exception as e:
-        info["client_diag_error"] = str(e)
-        info["has_responses"] = False
-
-    # also show any local files named openai that might shadow the package
-    try:
-        import os
-        repo_files = []
-        for root, dirs, files in os.walk(".", topdown=True):
-            for f in files:
-                if f.lower().startswith("openai"):
-                    repo_files.append(os.path.join(root, f))
-            # don't walk node_modules / .venv etc to keep this quick
-            if ".venv" in dirs:
-                dirs.remove(".venv")
-        info["local_openai_files"] = repo_files[:10]
-    except Exception:
-        info["local_openai_files"] = []
-
-    return info
+        return JSONResponse({
+            "ok": False,
+            "analysis_text": f"Server error: {str(e)}",
+            "confidence": 0
+        })
