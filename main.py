@@ -1,10 +1,12 @@
 import os
 import json
 import base64
+import io
 import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from PIL import Image, ImageDraw, ImageFilter
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
@@ -372,9 +374,9 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V2", "model": MODEL}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V3-HEATMAP", "model": MODEL}
 
-def to_data_url(upload: UploadFile) -> str:
+def upload_to_data_url(upload: UploadFile) -> tuple[str, bytes]:
     b = upload.file.read()
     if not b:
         raise ValueError("Empty upload")
@@ -382,11 +384,13 @@ def to_data_url(upload: UploadFile) -> str:
     name = (upload.filename or "").lower()
     if name.endswith(".png"):
         mime = "image/png"
+    elif name.endswith(".webp"):
+        mime = "image/webp"
     else:
         mime = "image/jpeg"
 
     b64 = base64.b64encode(b).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
+    return f"data:{mime};base64,{b64}", b
 
 def extract_output_text(resp_json: dict) -> str:
     out = []
@@ -395,6 +399,69 @@ def extract_output_text(resp_json: dict) -> str:
             if part.get("type") == "output_text" and isinstance(part.get("text"), str):
                 out.append(part["text"])
     return "\\n".join(out).strip()
+
+def clamp01(x):
+    try:
+        x = float(x)
+    except Exception:
+        return 0.0
+    if x < 0:
+        return 0.0
+    if x > 1:
+        return 1.0
+    return x
+
+def make_heatmap_overlay(base_bytes: bytes, polygon_points, heat_points):
+    if not base_bytes:
+        return None
+
+    try:
+        base = Image.open(io.BytesIO(base_bytes)).convert("RGBA")
+    except Exception:
+        return None
+
+    w, h = base.size
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+    # soft heat blobs
+    if heat_points:
+        blobs = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        bdraw = ImageDraw.Draw(blobs, "RGBA")
+        for p in heat_points:
+            try:
+                x = clamp01(p.get("x")) * w
+                y = clamp01(p.get("y")) * h
+                intensity = clamp01(p.get("intensity", 0.5))
+                radius = max(30, int(min(w, h) * (0.06 + 0.12 * intensity)))
+                alpha = int(70 + 120 * intensity)
+                bdraw.ellipse(
+                    (x - radius, y - radius, x + radius, y + radius),
+                    fill=(255, 40, 0, alpha),
+                )
+            except Exception:
+                continue
+
+        blobs = blobs.filter(ImageFilter.GaussianBlur(radius=max(12, int(min(w, h) * 0.03))))
+        overlay = Image.alpha_composite(overlay, blobs)
+
+    # outsole polygon outline
+    if polygon_points and isinstance(polygon_points, list) and len(polygon_points) >= 3:
+        try:
+            draw = ImageDraw.Draw(overlay, "RGBA")
+            pts = []
+            for p in polygon_points:
+                x = clamp01(p.get("x")) * w
+                y = clamp01(p.get("y")) * h
+                pts.append((x, y))
+            if len(pts) >= 3:
+                draw.polygon(pts, outline=(0, 255, 120, 220), fill=(0, 255, 120, 35), width=4)
+        except Exception:
+            pass
+
+    combined = Image.alpha_composite(base, overlay)
+    out = io.BytesIO()
+    combined.save(out, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("utf-8")
 
 @app.post("/analyze")
 @app.post("/analyse")
@@ -409,14 +476,16 @@ async def analyze(
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in Render env vars for this service")
 
     try:
-        left_url = to_data_url(left)
-        right_url = to_data_url(right)
-        rear_url = to_data_url(rear) if rear is not None and rear.filename else None
+        left_url, left_bytes = upload_to_data_url(left)
+        right_url, right_bytes = upload_to_data_url(right)
+        rear_url = None
+        if rear is not None and rear.filename:
+            rear_url, _rear_bytes = upload_to_data_url(rear)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
     response_schema = {
-        "name": "checkmyrun_pronation",
+        "name": "checkmyrun_pronation_heatmap",
         "strict": True,
         "schema": {
             "type": "object",
@@ -432,8 +501,33 @@ async def analyze(
                         },
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "notes": {"type": "string"},
+                        "outsole_polygon": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"}
+                                },
+                                "required": ["x", "y"]
+                            }
+                        },
+                        "heat_points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"},
+                                    "intensity": {"type": "number"}
+                                },
+                                "required": ["x", "y", "intensity"]
+                            }
+                        }
                     },
-                    "required": ["pronation", "confidence", "notes"],
+                    "required": ["pronation", "confidence", "notes", "outsole_polygon", "heat_points"],
                 },
                 "right": {
                     "type": "object",
@@ -445,8 +539,33 @@ async def analyze(
                         },
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "notes": {"type": "string"},
+                        "outsole_polygon": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"}
+                                },
+                                "required": ["x", "y"]
+                            }
+                        },
+                        "heat_points": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"},
+                                    "intensity": {"type": "number"}
+                                },
+                                "required": ["x", "y", "intensity"]
+                            }
+                        }
                     },
-                    "required": ["pronation", "confidence", "notes"],
+                    "required": ["pronation", "confidence", "notes", "outsole_polygon", "heat_points"],
                 },
                 "overall": {
                     "type": "object",
@@ -472,22 +591,9 @@ async def analyze(
                         "issues": {"type": "array", "items": {"type": "string"}},
                     },
                     "required": ["ok", "issues"],
-                },
-                "left_heatmap_data_url": {
-                    "type": ["string", "null"]
-                },
-                "right_heatmap_data_url": {
-                    "type": ["string", "null"]
                 }
             },
-            "required": [
-                "left",
-                "right",
-                "overall",
-                "photo_quality",
-                "left_heatmap_data_url",
-                "right_heatmap_data_url"
-            ],
+            "required": ["left", "right", "overall", "photo_quality"],
         },
     }
 
@@ -498,7 +604,9 @@ async def analyze(
         "Be conservative: if wear is unclear, output 'unclear' with low confidence. "
         "No medical advice. Notes must be short (1–2 sentences). "
         "Also assess photo quality and list issues. "
-        "If you cannot generate true heatmap images, set left_heatmap_data_url and right_heatmap_data_url to null. "
+        "For each sole, return an outsole_polygon tracing the visible sole boundary using normalized coordinates from 0 to 1. "
+        "For each sole, also return 6 to 12 heat_points in normalized coordinates from 0 to 1 where wear appears strongest, with intensity from 0 to 1. "
+        "Keep heat points only on the actual sole, not the background. "
         "Return ONLY valid JSON matching the schema."
     )
 
@@ -532,7 +640,7 @@ async def analyze(
                 "strict": True,
             }
         },
-        "max_output_tokens": 700,
+        "max_output_tokens": 1200,
     }
 
     try:
@@ -555,6 +663,23 @@ async def analyze(
     text = extract_output_text(resp_json)
 
     try:
-        return json.loads(text)
+        data = json.loads(text)
     except json.JSONDecodeError:
         return {"error": "Model returned non-JSON unexpectedly", "raw": text}
+
+    # Generate backend heatmaps
+    left_heatmap = make_heatmap_overlay(
+        left_bytes,
+        data.get("left", {}).get("outsole_polygon"),
+        data.get("left", {}).get("heat_points"),
+    )
+    right_heatmap = make_heatmap_overlay(
+        right_bytes,
+        data.get("right", {}).get("outsole_polygon"),
+        data.get("right", {}).get("heat_points"),
+    )
+
+    data["left_heatmap_data_url"] = left_heatmap
+    data["right_heatmap_data_url"] = right_heatmap
+
+    return data
