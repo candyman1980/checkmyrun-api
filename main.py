@@ -283,6 +283,29 @@ function showPreview(input, imgEl, placeholderEl) {
   placeholderEl.style.display = "none";
 }
 
+function safeSetOverlay(container, dataUrl, altText) {
+  container.innerHTML = "";
+  if (!dataUrl || typeof dataUrl !== "string") {
+    container.innerHTML = '<span class="muted">No overlay returned.</span>';
+    return;
+  }
+
+  const trimmed = dataUrl.trim();
+  if (!trimmed.startsWith("data:image/")) {
+    container.innerHTML = '<span class="muted">Overlay returned in unexpected format.</span>';
+    return;
+  }
+
+  try {
+    const img = document.createElement("img");
+    img.alt = altText;
+    img.src = trimmed;
+    container.appendChild(img);
+  } catch (e) {
+    container.innerHTML = '<span class="muted">Could not display overlay.</span>';
+  }
+}
+
 leftInput.addEventListener("change", () => showPreview(leftInput, leftPreview, leftPlaceholder));
 rightInput.addEventListener("change", () => showPreview(rightInput, rightPreview, rightPlaceholder));
 rearInput.addEventListener("change", () => showPreview(rearInput, rearPreview, rearPlaceholder));
@@ -292,6 +315,7 @@ form.addEventListener("submit", async (e) => {
   btn.disabled = true;
   status.textContent = "Uploading...";
   result.style.display = "none";
+
   summary.innerHTML = "";
   leftResult.innerHTML = "";
   rightResult.innerHTML = "";
@@ -309,6 +333,10 @@ form.addEventListener("submit", async (e) => {
     });
 
     const data = await res.json();
+
+    // Always show raw JSON first so debugging is never blank
+    jsonOut.textContent = JSON.stringify(data, null, 2);
+    result.style.display = "block";
 
     if (!res.ok) {
       throw new Error(data.detail || JSON.stringify(data));
@@ -346,20 +374,16 @@ form.addEventListener("submit", async (e) => {
       <ul>${(data.photo_quality?.issues || []).map(i => `<li>${i}</li>`).join("") || "<li>None</li>"}</ul>
     `;
 
-    if (data.left_heatmap_data_url) {
-      leftHeatmapWrap.innerHTML = `<img src="${data.left_heatmap_data_url}" alt="Left overlay">`;
-    }
+    safeSetOverlay(leftHeatmapWrap, data.left_heatmap_data_url, "Left overlay");
+    safeSetOverlay(rightHeatmapWrap, data.right_heatmap_data_url, "Right overlay");
 
-    if (data.right_heatmap_data_url) {
-      rightHeatmapWrap.innerHTML = `<img src="${data.right_heatmap_data_url}" alt="Right overlay">`;
-    }
-
-    jsonOut.textContent = JSON.stringify(data, null, 2);
-    result.style.display = "block";
     status.textContent = "Done ✅";
   } catch (err) {
     status.textContent = "Error";
-    summary.innerHTML = `<p style="color:#b00020"><strong>${err.message}</strong></p>`;
+    summary.innerHTML = `<p style="color:#b00020"><strong>${err.message || String(err)}</strong></p>`;
+    if (!jsonOut.textContent) {
+      jsonOut.textContent = String(err);
+    }
     result.style.display = "block";
   } finally {
     btn.disabled = false;
