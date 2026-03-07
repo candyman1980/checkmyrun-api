@@ -6,7 +6,7 @@ import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageStat
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
@@ -148,7 +148,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h1>CheckMyRun</h1>
-    <p>Upload clear photos of both soles and a rear photo. You’ll get a pronation estimate, shoe category suggestion, and wear heatmaps underneath.</p>
+    <p>Upload clear photos of both soles and a rear photo. You’ll get a pronation estimate, shoe category suggestion, and heatmaps underneath.</p>
 
     <form id="form" enctype="multipart/form-data">
       <div class="uploadGrid">
@@ -266,7 +266,7 @@ const rearPlaceholder = document.getElementById("rearPlaceholder");
 
 function prettyLabel(v) {
   if (!v) return "—";
-  return String(v).replace(/-/g, " ");
+  return String(v).replace(/_/g, " ").replace(/-/g, " ");
 }
 
 function showPreview(input, imgEl, placeholderEl) {
@@ -324,12 +324,14 @@ form.addEventListener("submit", async (e) => {
       <p><strong>Pronation:</strong> ${prettyLabel(data.left?.pronation)}</p>
       <p><strong>Confidence:</strong> ${Math.round((data.left?.confidence || 0) * 100)}%</p>
       <p>${data.left?.notes || ""}</p>
+      <p><strong>Wear zones:</strong> ${(data.left?.wear_zones || []).map(prettyLabel).join(", ") || "None obvious"}</p>
     `;
 
     rightResult.innerHTML = `
       <p><strong>Pronation:</strong> ${prettyLabel(data.right?.pronation)}</p>
       <p><strong>Confidence:</strong> ${Math.round((data.right?.confidence || 0) * 100)}%</p>
       <p>${data.right?.notes || ""}</p>
+      <p><strong>Wear zones:</strong> ${(data.right?.wear_zones || []).map(prettyLabel).join(", ") || "None obvious"}</p>
     `;
 
     overallResult.innerHTML = `
@@ -374,7 +376,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V4-POINTS", "model": MODEL}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "ZONE-V1", "model": MODEL}
 
 def upload_to_data_url(upload: UploadFile) -> tuple[str, bytes]:
     b = upload.file.read()
@@ -411,84 +413,142 @@ def clamp01(x):
         return 1.0
     return x
 
-def point_is_reasonable(px: float, py: float) -> bool:
-    # reject image edges / obvious background
-    return 0.12 <= px <= 0.88 and 0.08 <= py <= 0.96
+def img_to_data_url(img: Image.Image) -> str:
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("utf-8")
 
-def sanitise_heat_points(points):
-    if not isinstance(points, list):
-        return []
+def compute_zone_wear_scores(base_bytes: bytes):
+    """
+    Local wear scoring from the sole image itself.
+    We use fixed zones and score them by low saturation + darker/greyer appearance.
+    This is crude but far more stable than arbitrary model points.
+    """
+    img = Image.open(io.BytesIO(base_bytes)).convert("RGB")
+    w, h = img.size
 
-    clean = []
-    for p in points:
-        if not isinstance(p, dict):
-            continue
-        x = clamp01(p.get("x"))
-        y = clamp01(p.get("y"))
-        intensity = clamp01(p.get("intensity", 0.5))
+    # Ignore very outer margins and very bottom hand region as much as possible.
+    x0 = int(w * 0.12)
+    x1 = int(w * 0.88)
+    y0 = int(h * 0.06)
+    y1 = int(h * 0.90)
 
-        if not point_is_reasonable(x, y):
-            continue
+    # Zone rectangles in normalized sole space (relative to cropped working area)
+    zones = {
+        "lateral_forefoot": (0.00, 0.00, 0.42, 0.34),
+        "central_forefoot": (0.29, 0.14, 0.71, 0.42),
+        "medial_forefoot": (0.58, 0.00, 1.00, 0.34),
+        "lateral_midfoot": (0.02, 0.38, 0.35, 0.62),
+        "medial_midfoot": (0.65, 0.38, 0.98, 0.62),
+        "lateral_heel": (0.00, 0.68, 0.45, 1.00),
+        "central_heel": (0.28, 0.72, 0.72, 1.00),
+        "medial_heel": (0.55, 0.68, 1.00, 1.00),
+    }
 
-        clean.append({
-            "x": x,
-            "y": y,
-            "intensity": max(0.2, intensity)
-        })
+    scores = {}
 
-    # dedupe points that are almost identical
-    deduped = []
-    for p in clean:
-        too_close = False
-        for q in deduped:
-            if abs(p["x"] - q["x"]) < 0.03 and abs(p["y"] - q["y"]) < 0.03:
-                too_close = True
-                break
-        if not too_close:
-            deduped.append(p)
+    for name, (rx0, ry0, rx1, ry1) in zones.items():
+        zx0 = x0 + int((x1 - x0) * rx0)
+        zy0 = y0 + int((y1 - y0) * ry0)
+        zx1 = x0 + int((x1 - x0) * rx1)
+        zy1 = y0 + int((y1 - y0) * ry1)
 
-    return deduped[:8]
+        crop = img.crop((zx0, zy0, zx1, zy1)).convert("HSV")
+        stat = ImageStat.Stat(crop)
+        h_mean, s_mean, v_mean = stat.mean
 
-def make_heatmap_overlay(base_bytes: bytes, heat_points):
-    if not base_bytes:
+        # Lower saturation + lower brightness tends to correlate with worn greyed rubber.
+        sat_score = max(0.0, 1.0 - (s_mean / 255.0))
+        dark_score = max(0.0, 1.0 - (v_mean / 255.0))
+
+        # Weighted wear score.
+        wear = (0.62 * sat_score) + (0.38 * dark_score)
+        scores[name] = max(0.0, min(1.0, wear))
+
+    # Normalize relative to this shoe's own zone distribution.
+    vals = list(scores.values())
+    vmin = min(vals)
+    vmax = max(vals)
+    norm_scores = {}
+    for k, v in scores.items():
+        if vmax - vmin < 0.05:
+            norm_scores[k] = 0.2
+        else:
+            norm_scores[k] = max(0.0, min(1.0, (v - vmin) / (vmax - vmin)))
+
+    return norm_scores
+
+def top_wear_zones(scores: dict, threshold: float = 0.58):
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [name for name, score in ranked if score >= threshold][:3]
+
+def make_zone_heatmap_overlay(base_bytes: bytes, zone_scores: dict):
+    if not base_bytes or not zone_scores:
         return None
 
-    points = sanitise_heat_points(heat_points)
-    if len(points) < 2:
-        return None
-
-    try:
-        base = Image.open(io.BytesIO(base_bytes)).convert("RGBA")
-    except Exception:
-        return None
-
+    base = Image.open(io.BytesIO(base_bytes)).convert("RGBA")
     w, h = base.size
+
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+
+    x0 = int(w * 0.12)
+    x1 = int(w * 0.88)
+    y0 = int(h * 0.06)
+    y1 = int(h * 0.90)
+
+    zones = {
+        "lateral_forefoot": (0.00, 0.00, 0.42, 0.34),
+        "central_forefoot": (0.29, 0.14, 0.71, 0.42),
+        "medial_forefoot": (0.58, 0.00, 1.00, 0.34),
+        "lateral_midfoot": (0.02, 0.38, 0.35, 0.62),
+        "medial_midfoot": (0.65, 0.38, 0.98, 0.62),
+        "lateral_heel": (0.00, 0.68, 0.45, 1.00),
+        "central_heel": (0.28, 0.72, 0.72, 1.00),
+        "medial_heel": (0.55, 0.68, 1.00, 1.00),
+    }
 
     blobs = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     bdraw = ImageDraw.Draw(blobs, "RGBA")
 
-    for p in points:
-        x = p["x"] * w
-        y = p["y"] * h
-        intensity = p["intensity"]
+    for name, score in zone_scores.items():
+        if score < 0.35:
+            continue
 
-        radius = max(28, int(min(w, h) * (0.045 + 0.08 * intensity)))
-        alpha = int(90 + 110 * intensity)
+        rx0, ry0, rx1, ry1 = zones[name]
+        zx0 = x0 + int((x1 - x0) * rx0)
+        zy0 = y0 + int((y1 - y0) * ry0)
+        zx1 = x0 + int((x1 - x0) * rx1)
+        zy1 = y0 + int((y1 - y0) * ry1)
+
+        cx = (zx0 + zx1) / 2
+        cy = (zy0 + zy1) / 2
+        radius_x = max(36, int((zx1 - zx0) * 0.55))
+        radius_y = max(36, int((zy1 - zy0) * 0.55))
+        alpha = int(70 + score * 120)
 
         bdraw.ellipse(
-            (x - radius, y - radius, x + radius, y + radius),
-            fill=(255, 35, 0, alpha),
+            (cx - radius_x, cy - radius_y, cx + radius_x, cy + radius_y),
+            fill=(255, 45, 0, alpha),
         )
 
-    blur = max(10, int(min(w, h) * 0.02))
-    blobs = blobs.filter(ImageFilter.GaussianBlur(radius=blur))
+    blobs = blobs.filter(ImageFilter.GaussianBlur(radius=max(12, int(min(w, h) * 0.02))))
     overlay = Image.alpha_composite(overlay, blobs)
 
     combined = Image.alpha_composite(base, overlay)
-    out = io.BytesIO()
-    combined.save(out, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("utf-8")
+    return img_to_data_url(combined)
+
+def build_model_summary_prompt(left_scores, right_scores, rear_present: bool):
+    return (
+        "You are a running shoe fitting assistant. "
+        "You are given zone wear scores derived from outsole photos. "
+        "Use them conservatively to infer likely pronation. "
+        "Do not invent certainty. "
+        "Return JSON only.\n\n"
+        f"Left zone scores: {json.dumps(left_scores)}\n"
+        f"Right zone scores: {json.dumps(right_scores)}\n"
+        f"Rear photo present: {rear_present}\n"
+    )
 
 @app.post("/analyze")
 @app.post("/analyse")
@@ -505,14 +565,19 @@ async def analyze(
     try:
         left_url, left_bytes = upload_to_data_url(left)
         right_url, right_bytes = upload_to_data_url(right)
-        rear_url = None
-        if rear is not None and rear.filename:
-            rear_url, _rear_bytes = upload_to_data_url(rear)
+        rear_present = bool(rear is not None and rear.filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
+    left_scores = compute_zone_wear_scores(left_bytes)
+    right_scores = compute_zone_wear_scores(right_bytes)
+
+    left_wear_zones = top_wear_zones(left_scores)
+    right_wear_zones = top_wear_zones(right_scores)
+
+    # Ask model to interpret zone scores, not raw image coordinates.
     response_schema = {
-        "name": "checkmyrun_pronation_heatpoints",
+        "name": "checkmyrun_zone_summary",
         "strict": True,
         "schema": {
             "type": "object",
@@ -528,21 +593,8 @@ async def analyze(
                         },
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "notes": {"type": "string"},
-                        "heat_points": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "x": {"type": "number"},
-                                    "y": {"type": "number"},
-                                    "intensity": {"type": "number"}
-                                },
-                                "required": ["x", "y", "intensity"]
-                            }
-                        }
                     },
-                    "required": ["pronation", "confidence", "notes", "heat_points"],
+                    "required": ["pronation", "confidence", "notes"],
                 },
                 "right": {
                     "type": "object",
@@ -554,21 +606,8 @@ async def analyze(
                         },
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "notes": {"type": "string"},
-                        "heat_points": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "x": {"type": "number"},
-                                    "y": {"type": "number"},
-                                    "intensity": {"type": "number"}
-                                },
-                                "required": ["x", "y", "intensity"]
-                            }
-                        }
                     },
-                    "required": ["pronation", "confidence", "notes", "heat_points"],
+                    "required": ["pronation", "confidence", "notes"],
                 },
                 "overall": {
                     "type": "object",
@@ -600,41 +639,16 @@ async def analyze(
         },
     }
 
-    instruction = (
-        "You are a running shoe fitting assistant. "
-        "You will be given LEFT sole, RIGHT sole, and optionally a REAR shoe photo. "
-        "Infer pronation style from visible wear patterns. "
-        "Be conservative: if wear is unclear, output 'unclear' with low confidence. "
-        "No medical advice. Notes must be short (1–2 sentences). "
-        "Also assess photo quality and list issues. "
-        "For each sole, return 4 to 8 heat_points only where visible outsole wear appears strongest. "
-        "Use normalized coordinates from 0 to 1. "
-        "Do not include background, hand, floor, walls, shadows, or photo edges. "
-        "Do not trace the whole sole. "
-        "If unclear, return an empty heat_points array. "
-        "Return ONLY valid JSON matching the schema."
-    )
-
-    content = [
-        {"type": "input_text", "text": instruction},
-        {"type": "input_text", "text": "LEFT SOLE:"},
-        {"type": "input_image", "image_url": left_url},
-        {"type": "input_text", "text": "RIGHT SOLE:"},
-        {"type": "input_image", "image_url": right_url},
-    ]
-
-    if rear_url:
-        content.extend([
-            {"type": "input_text", "text": "REAR PHOTO:"},
-            {"type": "input_image", "image_url": rear_url},
-        ])
+    instruction = build_model_summary_prompt(left_scores, right_scores, rear_present)
 
     payload = {
         "model": MODEL,
         "input": [
             {
                 "role": "user",
-                "content": content,
+                "content": [
+                    {"type": "input_text", "text": instruction}
+                ],
             }
         ],
         "text": {
@@ -645,7 +659,7 @@ async def analyze(
                 "strict": True,
             }
         },
-        "max_output_tokens": 900,
+        "max_output_tokens": 700,
     }
 
     try:
@@ -672,16 +686,12 @@ async def analyze(
     except json.JSONDecodeError:
         return {"error": "Model returned non-JSON unexpectedly", "raw": text}
 
-    left_heatmap = make_heatmap_overlay(
-        left_bytes,
-        data.get("left", {}).get("heat_points"),
-    )
-    right_heatmap = make_heatmap_overlay(
-        right_bytes,
-        data.get("right", {}).get("heat_points"),
-    )
+    data["left"]["wear_zones"] = left_wear_zones
+    data["right"]["wear_zones"] = right_wear_zones
+    data["left_zone_scores"] = left_scores
+    data["right_zone_scores"] = right_scores
 
-    data["left_heatmap_data_url"] = left_heatmap
-    data["right_heatmap_data_url"] = right_heatmap
+    data["left_heatmap_data_url"] = make_zone_heatmap_overlay(left_bytes, left_scores)
+    data["right_heatmap_data_url"] = make_zone_heatmap_overlay(right_bytes, right_scores)
 
     return data
