@@ -148,7 +148,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h1>CheckMyRun</h1>
-    <p>Upload clear photos of both soles and a rear photo. You’ll get a pronation estimate, shoe category suggestion, and heatmaps underneath.</p>
+    <p>Upload clear photos of both soles and a rear photo. You’ll get a pronation estimate, shoe category suggestion, and wear heatmaps underneath.</p>
 
     <form id="form" enctype="multipart/form-data">
       <div class="uploadGrid">
@@ -374,7 +374,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V3-HEATMAP", "model": MODEL}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "OPENAI-V4-POINTS", "model": MODEL}
 
 def upload_to_data_url(upload: UploadFile) -> tuple[str, bytes]:
     b = upload.file.read()
@@ -411,8 +411,50 @@ def clamp01(x):
         return 1.0
     return x
 
-def make_heatmap_overlay(base_bytes: bytes, polygon_points, heat_points):
+def point_is_reasonable(px: float, py: float) -> bool:
+    # reject image edges / obvious background
+    return 0.12 <= px <= 0.88 and 0.08 <= py <= 0.96
+
+def sanitise_heat_points(points):
+    if not isinstance(points, list):
+        return []
+
+    clean = []
+    for p in points:
+        if not isinstance(p, dict):
+            continue
+        x = clamp01(p.get("x"))
+        y = clamp01(p.get("y"))
+        intensity = clamp01(p.get("intensity", 0.5))
+
+        if not point_is_reasonable(x, y):
+            continue
+
+        clean.append({
+            "x": x,
+            "y": y,
+            "intensity": max(0.2, intensity)
+        })
+
+    # dedupe points that are almost identical
+    deduped = []
+    for p in clean:
+        too_close = False
+        for q in deduped:
+            if abs(p["x"] - q["x"]) < 0.03 and abs(p["y"] - q["y"]) < 0.03:
+                too_close = True
+                break
+        if not too_close:
+            deduped.append(p)
+
+    return deduped[:8]
+
+def make_heatmap_overlay(base_bytes: bytes, heat_points):
     if not base_bytes:
+        return None
+
+    points = sanitise_heat_points(heat_points)
+    if len(points) < 2:
         return None
 
     try:
@@ -423,40 +465,25 @@ def make_heatmap_overlay(base_bytes: bytes, polygon_points, heat_points):
     w, h = base.size
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
 
-    # soft heat blobs
-    if heat_points:
-        blobs = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        bdraw = ImageDraw.Draw(blobs, "RGBA")
-        for p in heat_points:
-            try:
-                x = clamp01(p.get("x")) * w
-                y = clamp01(p.get("y")) * h
-                intensity = clamp01(p.get("intensity", 0.5))
-                radius = max(30, int(min(w, h) * (0.06 + 0.12 * intensity)))
-                alpha = int(70 + 120 * intensity)
-                bdraw.ellipse(
-                    (x - radius, y - radius, x + radius, y + radius),
-                    fill=(255, 40, 0, alpha),
-                )
-            except Exception:
-                continue
+    blobs = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    bdraw = ImageDraw.Draw(blobs, "RGBA")
 
-        blobs = blobs.filter(ImageFilter.GaussianBlur(radius=max(12, int(min(w, h) * 0.03))))
-        overlay = Image.alpha_composite(overlay, blobs)
+    for p in points:
+        x = p["x"] * w
+        y = p["y"] * h
+        intensity = p["intensity"]
 
-    # outsole polygon outline
-    if polygon_points and isinstance(polygon_points, list) and len(polygon_points) >= 3:
-        try:
-            draw = ImageDraw.Draw(overlay, "RGBA")
-            pts = []
-            for p in polygon_points:
-                x = clamp01(p.get("x")) * w
-                y = clamp01(p.get("y")) * h
-                pts.append((x, y))
-            if len(pts) >= 3:
-                draw.polygon(pts, outline=(0, 255, 120, 220), fill=(0, 255, 120, 35), width=4)
-        except Exception:
-            pass
+        radius = max(28, int(min(w, h) * (0.045 + 0.08 * intensity)))
+        alpha = int(90 + 110 * intensity)
+
+        bdraw.ellipse(
+            (x - radius, y - radius, x + radius, y + radius),
+            fill=(255, 35, 0, alpha),
+        )
+
+    blur = max(10, int(min(w, h) * 0.02))
+    blobs = blobs.filter(ImageFilter.GaussianBlur(radius=blur))
+    overlay = Image.alpha_composite(overlay, blobs)
 
     combined = Image.alpha_composite(base, overlay)
     out = io.BytesIO()
@@ -485,7 +512,7 @@ async def analyze(
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
     response_schema = {
-        "name": "checkmyrun_pronation_heatmap",
+        "name": "checkmyrun_pronation_heatpoints",
         "strict": True,
         "schema": {
             "type": "object",
@@ -501,18 +528,6 @@ async def analyze(
                         },
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "notes": {"type": "string"},
-                        "outsole_polygon": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "x": {"type": "number"},
-                                    "y": {"type": "number"}
-                                },
-                                "required": ["x", "y"]
-                            }
-                        },
                         "heat_points": {
                             "type": "array",
                             "items": {
@@ -527,7 +542,7 @@ async def analyze(
                             }
                         }
                     },
-                    "required": ["pronation", "confidence", "notes", "outsole_polygon", "heat_points"],
+                    "required": ["pronation", "confidence", "notes", "heat_points"],
                 },
                 "right": {
                     "type": "object",
@@ -539,18 +554,6 @@ async def analyze(
                         },
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "notes": {"type": "string"},
-                        "outsole_polygon": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "x": {"type": "number"},
-                                    "y": {"type": "number"}
-                                },
-                                "required": ["x", "y"]
-                            }
-                        },
                         "heat_points": {
                             "type": "array",
                             "items": {
@@ -565,7 +568,7 @@ async def analyze(
                             }
                         }
                     },
-                    "required": ["pronation", "confidence", "notes", "outsole_polygon", "heat_points"],
+                    "required": ["pronation", "confidence", "notes", "heat_points"],
                 },
                 "overall": {
                     "type": "object",
@@ -604,9 +607,11 @@ async def analyze(
         "Be conservative: if wear is unclear, output 'unclear' with low confidence. "
         "No medical advice. Notes must be short (1–2 sentences). "
         "Also assess photo quality and list issues. "
-        "For each sole, return an outsole_polygon tracing the visible sole boundary using normalized coordinates from 0 to 1. "
-        "For each sole, also return 6 to 12 heat_points in normalized coordinates from 0 to 1 where wear appears strongest, with intensity from 0 to 1. "
-        "Keep heat points only on the actual sole, not the background. "
+        "For each sole, return 4 to 8 heat_points only where visible outsole wear appears strongest. "
+        "Use normalized coordinates from 0 to 1. "
+        "Do not include background, hand, floor, walls, shadows, or photo edges. "
+        "Do not trace the whole sole. "
+        "If unclear, return an empty heat_points array. "
         "Return ONLY valid JSON matching the schema."
     )
 
@@ -640,7 +645,7 @@ async def analyze(
                 "strict": True,
             }
         },
-        "max_output_tokens": 1200,
+        "max_output_tokens": 900,
     }
 
     try:
@@ -667,15 +672,12 @@ async def analyze(
     except json.JSONDecodeError:
         return {"error": "Model returned non-JSON unexpectedly", "raw": text}
 
-    # Generate backend heatmaps
     left_heatmap = make_heatmap_overlay(
         left_bytes,
-        data.get("left", {}).get("outsole_polygon"),
         data.get("left", {}).get("heat_points"),
     )
     right_heatmap = make_heatmap_overlay(
         right_bytes,
-        data.get("right", {}).get("outsole_polygon"),
         data.get("right", {}).get("heat_points"),
     )
 
