@@ -1,18 +1,15 @@
 import os
-import json
 import base64
 import io
-import requests
+
 import cv2
 import numpy as np
+from PIL import Image
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from PIL import Image
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 
 app = FastAPI()
 
@@ -151,7 +148,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h1>CheckMyRun</h1>
-    <p>Upload clear photos of both soles and a rear photo. You’ll get a pronation estimate, shoe category suggestion, and wear overlays underneath.</p>
+    <p>Upload clear photos of both soles and a rear photo. You’ll get a local wear analysis and wear overlays underneath.</p>
 
     <form id="form" enctype="multipart/form-data">
       <div class="uploadGrid">
@@ -390,7 +387,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "MASK-V1", "model": MODEL}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V1"}
 
 def upload_to_data_url(upload: UploadFile) -> tuple[str, bytes]:
     b = upload.file.read()
@@ -408,29 +405,10 @@ def upload_to_data_url(upload: UploadFile) -> tuple[str, bytes]:
     b64 = base64.b64encode(b).decode("utf-8")
     return f"data:{mime};base64,{b64}", b
 
-def extract_output_text(resp_json: dict) -> str:
-    out = []
-    for item in resp_json.get("output", []):
-        for part in item.get("content", []):
-            if part.get("type") == "output_text" and isinstance(part.get("text"), str):
-                out.append(part["text"])
-    return "\\n".join(out).strip()
-
 def img_to_data_url_pil(img: Image.Image) -> str:
     out = io.BytesIO()
     img.save(out, format="PNG")
     return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("utf-8")
-
-def clamp01(x):
-    try:
-        x = float(x)
-    except Exception:
-        return 0.0
-    if x < 0:
-        return 0.0
-    if x > 1:
-        return 1.0
-    return x
 
 def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     arr = np.frombuffer(base_bytes, np.uint8)
@@ -462,7 +440,6 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
         gc_mask = np.zeros((h, w), np.uint8)
         gc_mask[rect[1]:rect[1]+rect[3], rect[0]:rect[0]+rect[2]] = 255
 
-    # kill the very bottom edge where hand/watch often appear
     gc_mask[int(h * 0.96):, :] = 0
 
     contours, _ = cv2.findContours(gc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -485,13 +462,11 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    h_chan, s_chan, v_chan = cv2.split(hsv)
+    _, s_chan, v_chan = cv2.split(hsv)
 
-    # Worn areas tend to be greyer, darker, and less saturated than fresh outsole rubber.
     low_sat = cv2.inRange(s_chan, 0, 95)
-    mid_dark = cv2.inRange(v_chan, 50, 190)
+    mid_dark = cv2.inRange(v_chan, 45, 190)
 
-    # Texture suppression: worn areas often look smoother / less patterned.
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
     lap = cv2.Laplacian(blur, cv2.CV_32F)
     texture = cv2.convertScaleAbs(lap)
@@ -505,10 +480,9 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
     wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_OPEN, kernel)
     wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_CLOSE, kernel)
 
-    # Remove tiny specks.
     contours, _ = cv2.findContours(wear_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     wear_mask = np.zeros_like(wear_candidate)
-    min_area = max(150, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.002))
+    min_area = max(120, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.001))
     for c in contours:
         area = cv2.contourArea(c)
         if area >= min_area:
@@ -539,9 +513,7 @@ def compute_zone_wear_scores(base_bytes: bytes) -> tuple[dict, np.ndarray, np.nd
         zy0 = y0 + int((y1 - y0) * ry0)
         zx1 = x0 + int((x1 - x0) * rx1)
         zy1 = y0 + int((y1 - y0) * ry1)
-
-        score = zone_score_from_mask(wear_mask, zx0, zy0, zx1, zy1)
-        scores[name] = score
+        scores[name] = zone_score_from_mask(wear_mask, zx0, zy0, zx1, zy1)
 
     vals = list(scores.values())
     vmin = min(vals)
@@ -566,18 +538,15 @@ def make_mask_overlay(base_bytes: bytes) -> tuple[str | None, dict]:
     base_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGBA)
     overlay = np.zeros_like(base_rgba, dtype=np.uint8)
 
-    # red fill only inside detected wear mask
     overlay[..., 0] = 255
     overlay[..., 1] = 45
     overlay[..., 2] = 0
-    overlay[..., 3] = np.where(wear_mask > 0, 120, 0).astype(np.uint8)
+    overlay[..., 3] = np.where(wear_mask > 0, 130, 0).astype(np.uint8)
 
-    # soften wear mask edges
     alpha = overlay[..., 3]
-    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=9, sigmaY=9)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=5, sigmaY=5)
     overlay[..., 3] = alpha
 
-    # green contour around sole only
     contours, _ = cv2.findContours(sole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         cv2.drawContours(overlay, contours, -1, (0, 255, 120, 180), thickness=3)
@@ -588,18 +557,65 @@ def make_mask_overlay(base_bytes: bytes) -> tuple[str | None, dict]:
 
     return img_to_data_url_pil(combined), scores
 
-def build_model_summary_prompt(left_scores, right_scores, rear_present: bool):
-    return (
-        "You are a running shoe fitting assistant. "
-        "You are given outsole wear-zone scores derived locally from shoe sole images. "
-        "Interpret them conservatively. "
-        "Do not invent certainty. "
-        "If the pattern is mixed or weak, prefer neutral or unclear over strong claims. "
-        "Return JSON only.\\n\\n"
-        f"Left zone scores: {json.dumps(left_scores)}\\n"
-        f"Right zone scores: {json.dumps(right_scores)}\\n"
-        f"Rear photo present: {rear_present}\\n"
-    )
+def infer_pronation_from_scores(left_scores: dict, right_scores: dict):
+    def side_result(scores: dict):
+        medial = max(scores.get("medial_forefoot", 0), scores.get("medial_heel", 0), scores.get("medial_midfoot", 0))
+        lateral = max(scores.get("lateral_forefoot", 0), scores.get("lateral_heel", 0), scores.get("lateral_midfoot", 0))
+        center = max(scores.get("central_forefoot", 0), scores.get("central_heel", 0))
+
+        diff = medial - lateral
+        strength = max(medial, lateral, center)
+
+        if strength < 0.20:
+            pronation = "unclear"
+            confidence = 0.25
+            notes = "Wear pattern is weak or not clearly distinguishable."
+        elif diff > 0.12:
+            pronation = "overpronation"
+            confidence = min(0.9, 0.45 + diff + strength * 0.25)
+            notes = "More wear appears on medial zones, suggesting inward roll."
+        elif diff < -0.12:
+            pronation = "underpronation"
+            confidence = min(0.9, 0.45 + abs(diff) + strength * 0.25)
+            notes = "More wear appears on lateral zones, suggesting outward loading."
+        else:
+            pronation = "neutral"
+            confidence = min(0.85, 0.45 + strength * 0.25)
+            notes = "Wear appears relatively balanced across the sole."
+        return pronation, round(confidence, 2), notes
+
+    lp, lc, ln = side_result(left_scores)
+    rp, rc, rn = side_result(right_scores)
+
+    votes = [lp, rp]
+    if votes.count("overpronation") >= 2:
+        overall = "overpronation"
+        shoe_category = "stability"
+    elif votes.count("underpronation") >= 2:
+        overall = "underpronation"
+        shoe_category = "cushioned-neutral"
+    elif votes.count("neutral") >= 1:
+        overall = "neutral"
+        shoe_category = "neutral"
+    else:
+        overall = "unclear"
+        shoe_category = "unclear"
+
+    overall_conf = round((lc + rc) / 2, 2)
+
+    return {
+        "left": {"pronation": lp, "confidence": lc, "notes": ln},
+        "right": {"pronation": rp, "confidence": rc, "notes": rn},
+        "overall": {
+            "pronation": overall,
+            "shoe_category": shoe_category,
+            "confidence": overall_conf,
+        },
+        "photo_quality": {
+            "ok": True,
+            "issues": []
+        }
+    }
 
 @app.post("/analyze")
 @app.post("/analyse")
@@ -610,13 +626,9 @@ async def analyze(
     right: UploadFile = File(...),
     rear: UploadFile = File(None),
 ):
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in Render env vars for this service")
-
     try:
-        _left_url, left_bytes = upload_to_data_url(left)
-        _right_url, right_bytes = upload_to_data_url(right)
-        rear_present = bool(rear is not None and rear.filename)
+        _, left_bytes = upload_to_data_url(left)
+        _, right_bytes = upload_to_data_url(right)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
@@ -626,121 +638,10 @@ async def analyze(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not analyse sole images: {e}")
 
-    left_wear_zones = top_wear_zones(left_scores)
-    right_wear_zones = top_wear_zones(right_scores)
+    data = infer_pronation_from_scores(left_scores, right_scores)
 
-    response_schema = {
-        "name": "checkmyrun_mask_summary",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "left": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "pronation": {
-                            "type": "string",
-                            "enum": ["overpronation", "underpronation", "neutral", "unclear"]
-                        },
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        "notes": {"type": "string"},
-                    },
-                    "required": ["pronation", "confidence", "notes"],
-                },
-                "right": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "pronation": {
-                            "type": "string",
-                            "enum": ["overpronation", "underpronation", "neutral", "unclear"]
-                        },
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        "notes": {"type": "string"},
-                    },
-                    "required": ["pronation", "confidence", "notes"],
-                },
-                "overall": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "pronation": {
-                            "type": "string",
-                            "enum": ["overpronation", "underpronation", "neutral", "unclear"]
-                        },
-                        "shoe_category": {
-                            "type": "string",
-                            "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]
-                        },
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    },
-                    "required": ["pronation", "shoe_category", "confidence"],
-                },
-                "photo_quality": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "ok": {"type": "boolean"},
-                        "issues": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["ok", "issues"],
-                }
-            },
-            "required": ["left", "right", "overall", "photo_quality"],
-        },
-    }
-
-    instruction = build_model_summary_prompt(left_scores, right_scores, rear_present)
-
-    payload = {
-        "model": MODEL,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": instruction}
-                ],
-            }
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": response_schema["name"],
-                "schema": response_schema["schema"],
-                "strict": True,
-            }
-        },
-        "max_output_tokens": 700,
-    }
-
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=90,
-        )
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"OpenAI request failed: {e}")
-
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"OpenAI error {r.status_code}: {r.text}")
-
-    resp_json = r.json()
-    text = extract_output_text(resp_json)
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return {"error": "Model returned non-JSON unexpectedly", "raw": text}
-
-    data["left"]["wear_zones"] = left_wear_zones
-    data["right"]["wear_zones"] = right_wear_zones
+    data["left"]["wear_zones"] = top_wear_zones(left_scores)
+    data["right"]["wear_zones"] = top_wear_zones(right_scores)
     data["left_zone_scores"] = left_scores
     data["right_zone_scores"] = right_scores
     data["left_heatmap_data_url"] = left_overlay
