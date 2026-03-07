@@ -3,10 +3,13 @@ import json
 import base64
 import io
 import requests
+import cv2
+import numpy as np
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from PIL import Image, ImageDraw, ImageFilter, ImageStat
+from PIL import Image
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
@@ -148,7 +151,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h1>CheckMyRun</h1>
-    <p>Upload clear photos of both soles and a rear photo. You’ll get a pronation estimate, shoe category suggestion, and heatmaps underneath.</p>
+    <p>Upload clear photos of both soles and a rear photo. You’ll get a pronation estimate, shoe category suggestion, and wear overlays underneath.</p>
 
     <form id="form" enctype="multipart/form-data">
       <div class="uploadGrid">
@@ -212,16 +215,16 @@ INDEX_HTML = """
         </div>
       </div>
 
-      <h2 class="sectionTitle">Heatmaps</h2>
+      <h2 class="sectionTitle">Wear overlays</h2>
       <div class="heatmap-grid">
         <div class="heatmap-card">
-          <h3>Left heatmap</h3>
-          <div id="leftHeatmapWrap" class="muted">No heatmap returned yet.</div>
+          <h3>Left overlay</h3>
+          <div id="leftHeatmapWrap" class="muted">No overlay returned yet.</div>
         </div>
 
         <div class="heatmap-card">
-          <h3>Right heatmap</h3>
-          <div id="rightHeatmapWrap" class="muted">No heatmap returned yet.</div>
+          <h3>Right overlay</h3>
+          <div id="rightHeatmapWrap" class="muted">No overlay returned yet.</div>
         </div>
       </div>
 
@@ -297,8 +300,8 @@ form.addEventListener("submit", async (e) => {
   rightResult.innerHTML = "";
   overallResult.innerHTML = "";
   qualityResult.innerHTML = "";
-  leftHeatmapWrap.innerHTML = '<span class="muted">No heatmap returned yet.</span>';
-  rightHeatmapWrap.innerHTML = '<span class="muted">No heatmap returned yet.</span>';
+  leftHeatmapWrap.innerHTML = '<span class="muted">No overlay returned yet.</span>';
+  rightHeatmapWrap.innerHTML = '<span class="muted">No overlay returned yet.</span>';
   jsonOut.textContent = "";
 
   try {
@@ -347,11 +350,11 @@ form.addEventListener("submit", async (e) => {
     `;
 
     if (data.left_heatmap_data_url) {
-      leftHeatmapWrap.innerHTML = `<img src="${data.left_heatmap_data_url}" alt="Left heatmap">`;
+      leftHeatmapWrap.innerHTML = `<img src="${data.left_heatmap_data_url}" alt="Left overlay">`;
     }
 
     if (data.right_heatmap_data_url) {
-      rightHeatmapWrap.innerHTML = `<img src="${data.right_heatmap_data_url}" alt="Right heatmap">`;
+      rightHeatmapWrap.innerHTML = `<img src="${data.right_heatmap_data_url}" alt="Right overlay">`;
     }
 
     jsonOut.textContent = JSON.stringify(data, null, 2);
@@ -370,13 +373,24 @@ form.addEventListener("submit", async (e) => {
 </html>
 """
 
+ZONE_RECTS = {
+    "lateral_forefoot": (0.00, 0.00, 0.42, 0.34),
+    "central_forefoot": (0.29, 0.14, 0.71, 0.42),
+    "medial_forefoot": (0.58, 0.00, 1.00, 0.34),
+    "lateral_midfoot": (0.02, 0.38, 0.35, 0.62),
+    "medial_midfoot": (0.65, 0.38, 0.98, 0.62),
+    "lateral_heel": (0.00, 0.68, 0.45, 1.00),
+    "central_heel": (0.28, 0.72, 0.72, 1.00),
+    "medial_heel": (0.55, 0.68, 1.00, 1.00),
+}
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     return HTMLResponse(content=INDEX_HTML, status_code=200)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "ZONE-V1", "model": MODEL}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "MASK-V1", "model": MODEL}
 
 def upload_to_data_url(upload: UploadFile) -> tuple[str, bytes]:
     b = upload.file.read()
@@ -402,6 +416,11 @@ def extract_output_text(resp_json: dict) -> str:
                 out.append(part["text"])
     return "\\n".join(out).strip()
 
+def img_to_data_url_pil(img: Image.Image) -> str:
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("utf-8")
+
 def clamp01(x):
     try:
         x = float(x)
@@ -413,141 +432,173 @@ def clamp01(x):
         return 1.0
     return x
 
-def img_to_data_url(img: Image.Image) -> str:
-    out = io.BytesIO()
-    img.save(out, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("utf-8")
+def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.frombuffer(base_bytes, np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("Could not decode image")
 
-def compute_zone_wear_scores(base_bytes: bytes):
-    """
-    Local wear scoring from the sole image itself.
-    We use fixed zones and score them by low saturation + darker/greyer appearance.
-    This is crude but far more stable than arbitrary model points.
-    """
-    img = Image.open(io.BytesIO(base_bytes)).convert("RGB")
-    w, h = img.size
+    h, w = img_bgr.shape[:2]
 
-    # Ignore very outer margins and very bottom hand region as much as possible.
-    x0 = int(w * 0.12)
-    x1 = int(w * 0.88)
-    y0 = int(h * 0.06)
-    y1 = int(h * 0.90)
+    mask = np.zeros((h, w), np.uint8)
+    rect = (
+        int(w * 0.10),
+        int(h * 0.04),
+        int(w * 0.80),
+        int(h * 0.88),
+    )
 
-    # Zone rectangles in normalized sole space (relative to cropped working area)
-    zones = {
-        "lateral_forefoot": (0.00, 0.00, 0.42, 0.34),
-        "central_forefoot": (0.29, 0.14, 0.71, 0.42),
-        "medial_forefoot": (0.58, 0.00, 1.00, 0.34),
-        "lateral_midfoot": (0.02, 0.38, 0.35, 0.62),
-        "medial_midfoot": (0.65, 0.38, 0.98, 0.62),
-        "lateral_heel": (0.00, 0.68, 0.45, 1.00),
-        "central_heel": (0.28, 0.72, 0.72, 1.00),
-        "medial_heel": (0.55, 0.68, 1.00, 1.00),
-    }
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(img_bgr, mask, rect, bgd_model, fgd_model, 4, cv2.GC_INIT_WITH_RECT)
+        gc_mask = np.where(
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+            255,
+            0
+        ).astype("uint8")
+    except Exception:
+        gc_mask = np.zeros((h, w), np.uint8)
+        gc_mask[rect[1]:rect[1]+rect[3], rect[0]:rect[0]+rect[2]] = 255
+
+    # kill the very bottom edge where hand/watch often appear
+    gc_mask[int(h * 0.96):, :] = 0
+
+    contours, _ = cv2.findContours(gc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        sole_mask = np.zeros_like(gc_mask)
+        cv2.drawContours(sole_mask, [contours[0]], -1, 255, thickness=cv2.FILLED)
+    else:
+        sole_mask = gc_mask
+
+    kernel = np.ones((9, 9), np.uint8)
+    sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, kernel)
+    sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, kernel)
+
+    return img_bgr, sole_mask
+
+def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    img_bgr, sole_mask = extract_sole_mask(base_bytes)
+
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    h_chan, s_chan, v_chan = cv2.split(hsv)
+
+    # Worn areas tend to be greyer, darker, and less saturated than fresh outsole rubber.
+    low_sat = cv2.inRange(s_chan, 0, 95)
+    mid_dark = cv2.inRange(v_chan, 50, 190)
+
+    # Texture suppression: worn areas often look smoother / less patterned.
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    lap = cv2.Laplacian(blur, cv2.CV_32F)
+    texture = cv2.convertScaleAbs(lap)
+    low_texture = cv2.inRange(texture, 0, 28)
+
+    wear_candidate = cv2.bitwise_and(low_sat, mid_dark)
+    wear_candidate = cv2.bitwise_and(wear_candidate, low_texture)
+    wear_candidate = cv2.bitwise_and(wear_candidate, sole_mask)
+
+    kernel = np.ones((7, 7), np.uint8)
+    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_OPEN, kernel)
+    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_CLOSE, kernel)
+
+    # Remove tiny specks.
+    contours, _ = cv2.findContours(wear_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    wear_mask = np.zeros_like(wear_candidate)
+    min_area = max(150, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.002))
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area >= min_area:
+            cv2.drawContours(wear_mask, [c], -1, 255, thickness=cv2.FILLED)
+
+    return img_bgr, sole_mask, wear_mask
+
+def zone_score_from_mask(mask: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
+    roi = mask[y0:y1, x0:x1]
+    if roi.size == 0:
+        return 0.0
+    return float(np.count_nonzero(roi)) / float(roi.size)
+
+def compute_zone_wear_scores(base_bytes: bytes) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
+    img_bgr, sole_mask, wear_mask = compute_wear_mask(base_bytes)
+    h, w = sole_mask.shape[:2]
+
+    ys, xs = np.where(sole_mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        raise ValueError("Could not isolate sole")
+
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
 
     scores = {}
-
-    for name, (rx0, ry0, rx1, ry1) in zones.items():
+    for name, (rx0, ry0, rx1, ry1) in ZONE_RECTS.items():
         zx0 = x0 + int((x1 - x0) * rx0)
         zy0 = y0 + int((y1 - y0) * ry0)
         zx1 = x0 + int((x1 - x0) * rx1)
         zy1 = y0 + int((y1 - y0) * ry1)
 
-        crop = img.crop((zx0, zy0, zx1, zy1)).convert("HSV")
-        stat = ImageStat.Stat(crop)
-        h_mean, s_mean, v_mean = stat.mean
+        score = zone_score_from_mask(wear_mask, zx0, zy0, zx1, zy1)
+        scores[name] = score
 
-        # Lower saturation + lower brightness tends to correlate with worn greyed rubber.
-        sat_score = max(0.0, 1.0 - (s_mean / 255.0))
-        dark_score = max(0.0, 1.0 - (v_mean / 255.0))
-
-        # Weighted wear score.
-        wear = (0.62 * sat_score) + (0.38 * dark_score)
-        scores[name] = max(0.0, min(1.0, wear))
-
-    # Normalize relative to this shoe's own zone distribution.
     vals = list(scores.values())
     vmin = min(vals)
     vmax = max(vals)
+
     norm_scores = {}
     for k, v in scores.items():
-        if vmax - vmin < 0.05:
-            norm_scores[k] = 0.2
+        if vmax - vmin < 1e-6:
+            norm_scores[k] = 0.0
         else:
             norm_scores[k] = max(0.0, min(1.0, (v - vmin) / (vmax - vmin)))
 
-    return norm_scores
+    return norm_scores, img_bgr, sole_mask, wear_mask
 
-def top_wear_zones(scores: dict, threshold: float = 0.58):
+def top_wear_zones(scores: dict, threshold: float = 0.45):
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    return [name for name, score in ranked if score >= threshold][:3]
+    return [name for name, score in ranked if score >= threshold][:4]
 
-def make_zone_heatmap_overlay(base_bytes: bytes, zone_scores: dict):
-    if not base_bytes or not zone_scores:
-        return None
+def make_mask_overlay(base_bytes: bytes) -> tuple[str | None, dict]:
+    scores, img_bgr, sole_mask, wear_mask = compute_zone_wear_scores(base_bytes)
 
-    base = Image.open(io.BytesIO(base_bytes)).convert("RGBA")
-    w, h = base.size
+    base_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGBA)
+    overlay = np.zeros_like(base_rgba, dtype=np.uint8)
 
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay, "RGBA")
+    # red fill only inside detected wear mask
+    overlay[..., 0] = 255
+    overlay[..., 1] = 45
+    overlay[..., 2] = 0
+    overlay[..., 3] = np.where(wear_mask > 0, 120, 0).astype(np.uint8)
 
-    x0 = int(w * 0.12)
-    x1 = int(w * 0.88)
-    y0 = int(h * 0.06)
-    y1 = int(h * 0.90)
+    # soften wear mask edges
+    alpha = overlay[..., 3]
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=9, sigmaY=9)
+    overlay[..., 3] = alpha
 
-    zones = {
-        "lateral_forefoot": (0.00, 0.00, 0.42, 0.34),
-        "central_forefoot": (0.29, 0.14, 0.71, 0.42),
-        "medial_forefoot": (0.58, 0.00, 1.00, 0.34),
-        "lateral_midfoot": (0.02, 0.38, 0.35, 0.62),
-        "medial_midfoot": (0.65, 0.38, 0.98, 0.62),
-        "lateral_heel": (0.00, 0.68, 0.45, 1.00),
-        "central_heel": (0.28, 0.72, 0.72, 1.00),
-        "medial_heel": (0.55, 0.68, 1.00, 1.00),
-    }
+    # green contour around sole only
+    contours, _ = cv2.findContours(sole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(overlay, contours, -1, (0, 255, 120, 180), thickness=3)
 
-    blobs = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    bdraw = ImageDraw.Draw(blobs, "RGBA")
+    base_img = Image.fromarray(base_rgba, mode="RGBA")
+    overlay_img = Image.fromarray(overlay, mode="RGBA")
+    combined = Image.alpha_composite(base_img, overlay_img)
 
-    for name, score in zone_scores.items():
-        if score < 0.35:
-            continue
-
-        rx0, ry0, rx1, ry1 = zones[name]
-        zx0 = x0 + int((x1 - x0) * rx0)
-        zy0 = y0 + int((y1 - y0) * ry0)
-        zx1 = x0 + int((x1 - x0) * rx1)
-        zy1 = y0 + int((y1 - y0) * ry1)
-
-        cx = (zx0 + zx1) / 2
-        cy = (zy0 + zy1) / 2
-        radius_x = max(36, int((zx1 - zx0) * 0.55))
-        radius_y = max(36, int((zy1 - zy0) * 0.55))
-        alpha = int(70 + score * 120)
-
-        bdraw.ellipse(
-            (cx - radius_x, cy - radius_y, cx + radius_x, cy + radius_y),
-            fill=(255, 45, 0, alpha),
-        )
-
-    blobs = blobs.filter(ImageFilter.GaussianBlur(radius=max(12, int(min(w, h) * 0.02))))
-    overlay = Image.alpha_composite(overlay, blobs)
-
-    combined = Image.alpha_composite(base, overlay)
-    return img_to_data_url(combined)
+    return img_to_data_url_pil(combined), scores
 
 def build_model_summary_prompt(left_scores, right_scores, rear_present: bool):
     return (
         "You are a running shoe fitting assistant. "
-        "You are given zone wear scores derived from outsole photos. "
-        "Use them conservatively to infer likely pronation. "
+        "You are given outsole wear-zone scores derived locally from shoe sole images. "
+        "Interpret them conservatively. "
         "Do not invent certainty. "
-        "Return JSON only.\n\n"
-        f"Left zone scores: {json.dumps(left_scores)}\n"
-        f"Right zone scores: {json.dumps(right_scores)}\n"
-        f"Rear photo present: {rear_present}\n"
+        "If the pattern is mixed or weak, prefer neutral or unclear over strong claims. "
+        "Return JSON only.\\n\\n"
+        f"Left zone scores: {json.dumps(left_scores)}\\n"
+        f"Right zone scores: {json.dumps(right_scores)}\\n"
+        f"Rear photo present: {rear_present}\\n"
     )
 
 @app.post("/analyze")
@@ -563,21 +614,23 @@ async def analyze(
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in Render env vars for this service")
 
     try:
-        left_url, left_bytes = upload_to_data_url(left)
-        right_url, right_bytes = upload_to_data_url(right)
+        _left_url, left_bytes = upload_to_data_url(left)
+        _right_url, right_bytes = upload_to_data_url(right)
         rear_present = bool(rear is not None and rear.filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
-    left_scores = compute_zone_wear_scores(left_bytes)
-    right_scores = compute_zone_wear_scores(right_bytes)
+    try:
+        left_overlay, left_scores = make_mask_overlay(left_bytes)
+        right_overlay, right_scores = make_mask_overlay(right_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not analyse sole images: {e}")
 
     left_wear_zones = top_wear_zones(left_scores)
     right_wear_zones = top_wear_zones(right_scores)
 
-    # Ask model to interpret zone scores, not raw image coordinates.
     response_schema = {
-        "name": "checkmyrun_zone_summary",
+        "name": "checkmyrun_mask_summary",
         "strict": True,
         "schema": {
             "type": "object",
@@ -690,8 +743,7 @@ async def analyze(
     data["right"]["wear_zones"] = right_wear_zones
     data["left_zone_scores"] = left_scores
     data["right_zone_scores"] = right_scores
-
-    data["left_heatmap_data_url"] = make_zone_heatmap_overlay(left_bytes, left_scores)
-    data["right_heatmap_data_url"] = make_zone_heatmap_overlay(right_bytes, right_scores)
+    data["left_heatmap_data_url"] = left_overlay
+    data["right_heatmap_data_url"] = right_overlay
 
     return data
