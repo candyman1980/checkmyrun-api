@@ -1,4 +1,3 @@
-import os
 import base64
 import io
 
@@ -10,6 +9,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
+cv2.setNumThreads(1)
 
 app = FastAPI()
 
@@ -315,7 +315,6 @@ form.addEventListener("submit", async (e) => {
   btn.disabled = true;
   status.textContent = "Uploading...";
   result.style.display = "none";
-
   summary.innerHTML = "";
   leftResult.innerHTML = "";
   rightResult.innerHTML = "";
@@ -333,8 +332,6 @@ form.addEventListener("submit", async (e) => {
     });
 
     const data = await res.json();
-
-    // Always show raw JSON first so debugging is never blank
     jsonOut.textContent = JSON.stringify(data, null, 2);
     result.style.display = "block";
 
@@ -411,28 +408,25 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V1"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V2"}
 
-def upload_to_data_url(upload: UploadFile) -> tuple[str, bytes]:
+def upload_to_bytes(upload: UploadFile) -> bytes:
     b = upload.file.read()
     if not b:
         raise ValueError("Empty upload")
-
-    name = (upload.filename or "").lower()
-    if name.endswith(".png"):
-        mime = "image/png"
-    elif name.endswith(".webp"):
-        mime = "image/webp"
-    else:
-        mime = "image/jpeg"
-
-    b64 = base64.b64encode(b).decode("utf-8")
-    return f"data:{mime};base64,{b64}", b
+    return b
 
 def img_to_data_url_pil(img: Image.Image) -> str:
     out = io.BytesIO()
     img.save(out, format="PNG")
     return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("utf-8")
+
+def resize_for_processing(img_bgr: np.ndarray, max_size: int = 900) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    scale = max_size / max(h, w)
+    if scale < 1:
+        img_bgr = cv2.resize(img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return img_bgr
 
 def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     arr = np.frombuffer(base_bytes, np.uint8)
@@ -440,6 +434,7 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     if img_bgr is None:
         raise ValueError("Could not decode image")
 
+    img_bgr = resize_for_processing(img_bgr, max_size=900)
     h, w = img_bgr.shape[:2]
 
     mask = np.zeros((h, w), np.uint8)
@@ -454,7 +449,7 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     fgd_model = np.zeros((1, 65), np.float64)
 
     try:
-        cv2.grabCut(img_bgr, mask, rect, bgd_model, fgd_model, 4, cv2.GC_INIT_WITH_RECT)
+        cv2.grabCut(img_bgr, mask, rect, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_RECT)
         gc_mask = np.where(
             (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
             255,
@@ -462,7 +457,7 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
         ).astype("uint8")
     except Exception:
         gc_mask = np.zeros((h, w), np.uint8)
-        gc_mask[rect[1]:rect[1]+rect[3], rect[0]:rect[0]+rect[2]] = 255
+        gc_mask[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]] = 255
 
     gc_mask[int(h * 0.96):, :] = 0
 
@@ -474,7 +469,7 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     else:
         sole_mask = gc_mask
 
-    kernel = np.ones((9, 9), np.uint8)
+    kernel = np.ones((7, 7), np.uint8)
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, kernel)
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, kernel)
 
@@ -491,22 +486,22 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
     low_sat = cv2.inRange(s_chan, 0, 95)
     mid_dark = cv2.inRange(v_chan, 45, 190)
 
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
     lap = cv2.Laplacian(blur, cv2.CV_32F)
     texture = cv2.convertScaleAbs(lap)
-    low_texture = cv2.inRange(texture, 0, 28)
+    low_texture = cv2.inRange(texture, 0, 24)
 
     wear_candidate = cv2.bitwise_and(low_sat, mid_dark)
     wear_candidate = cv2.bitwise_and(wear_candidate, low_texture)
     wear_candidate = cv2.bitwise_and(wear_candidate, sole_mask)
 
-    kernel = np.ones((7, 7), np.uint8)
+    kernel = np.ones((5, 5), np.uint8)
     wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_OPEN, kernel)
     wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(wear_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     wear_mask = np.zeros_like(wear_candidate)
-    min_area = max(120, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.001))
+    min_area = max(80, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.0008))
     for c in contours:
         area = cv2.contourArea(c)
         if area >= min_area:
@@ -522,7 +517,6 @@ def zone_score_from_mask(mask: np.ndarray, x0: int, y0: int, x1: int, y1: int) -
 
 def compute_zone_wear_scores(base_bytes: bytes) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     img_bgr, sole_mask, wear_mask = compute_wear_mask(base_bytes)
-    h, w = sole_mask.shape[:2]
 
     ys, xs = np.where(sole_mask > 0)
     if len(xs) == 0 or len(ys) == 0:
@@ -568,12 +562,12 @@ def make_mask_overlay(base_bytes: bytes) -> tuple[str | None, dict]:
     overlay[..., 3] = np.where(wear_mask > 0, 130, 0).astype(np.uint8)
 
     alpha = overlay[..., 3]
-    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=5, sigmaY=5)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=4, sigmaY=4)
     overlay[..., 3] = alpha
 
     contours, _ = cv2.findContours(sole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
-        cv2.drawContours(overlay, contours, -1, (0, 255, 120, 180), thickness=3)
+        cv2.drawContours(overlay, contours, -1, (0, 255, 120, 180), thickness=2)
 
     base_img = Image.fromarray(base_rgba, mode="RGBA")
     overlay_img = Image.fromarray(overlay, mode="RGBA")
@@ -651,8 +645,8 @@ async def analyze(
     rear: UploadFile = File(None),
 ):
     try:
-        _, left_bytes = upload_to_data_url(left)
-        _, right_bytes = upload_to_data_url(right)
+        left_bytes = upload_to_bytes(left)
+        right_bytes = upload_to_bytes(right)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
