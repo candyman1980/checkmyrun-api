@@ -289,13 +289,11 @@ function safeSetOverlay(container, dataUrl, altText) {
     container.innerHTML = '<span class="muted">No overlay returned.</span>';
     return;
   }
-
   const trimmed = dataUrl.trim();
   if (!trimmed.startsWith("data:image/")) {
     container.innerHTML = '<span class="muted">Overlay returned in unexpected format.</span>';
     return;
   }
-
   try {
     const img = document.createElement("img");
     img.alt = altText;
@@ -408,7 +406,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V2"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V3"}
 
 def upload_to_bytes(upload: UploadFile) -> bytes:
     b = upload.file.read()
@@ -478,21 +476,17 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
 def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     img_bgr, sole_mask = extract_sole_mask(base_bytes)
 
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    _, s_chan, v_chan = cv2.split(hsv)
-
-    low_sat = cv2.inRange(s_chan, 0, 95)
-    mid_dark = cv2.inRange(v_chan, 45, 190)
-
+    gray = cv2.equalizeHist(gray)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    lap = cv2.Laplacian(blur, cv2.CV_32F)
-    texture = cv2.convertScaleAbs(lap)
-    low_texture = cv2.inRange(texture, 0, 24)
 
-    wear_candidate = cv2.bitwise_and(low_sat, mid_dark)
-    wear_candidate = cv2.bitwise_and(wear_candidate, low_texture)
+    # True-wear signal: low edge density + relatively brighter smooth rubber.
+    edges = cv2.Canny(blur, 40, 120)
+    edge_density = cv2.blur(edges, (21, 21))
+    low_edges = cv2.inRange(edge_density, 0, 12)
+    bright = cv2.inRange(gray, 110, 255)
+
+    wear_candidate = cv2.bitwise_and(low_edges, bright)
     wear_candidate = cv2.bitwise_and(wear_candidate, sole_mask)
 
     kernel = np.ones((5, 5), np.uint8)
@@ -515,9 +509,7 @@ def zone_score_from_mask(mask: np.ndarray, x0: int, y0: int, x1: int, y1: int) -
         return 0.0
     return float(np.count_nonzero(roi)) / float(roi.size)
 
-def compute_zone_wear_scores(base_bytes: bytes) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
-    img_bgr, sole_mask, wear_mask = compute_wear_mask(base_bytes)
-
+def compute_zone_wear_scores_from_masks(sole_mask: np.ndarray, wear_mask: np.ndarray) -> dict:
     ys, xs = np.where(sole_mask > 0)
     if len(xs) == 0 or len(ys) == 0:
         raise ValueError("Could not isolate sole")
@@ -544,15 +536,54 @@ def compute_zone_wear_scores(base_bytes: bytes) -> tuple[dict, np.ndarray, np.nd
         else:
             norm_scores[k] = max(0.0, min(1.0, (v - vmin) / (vmax - vmin)))
 
-    return norm_scores, img_bgr, sole_mask, wear_mask
+    return norm_scores
 
-def top_wear_zones(scores: dict, threshold: float = 0.45):
+def mirror_right_scores_to_left_frame(right_scores: dict) -> dict:
+    mapping = {
+        "lateral_forefoot": "medial_forefoot",
+        "central_forefoot": "central_forefoot",
+        "medial_forefoot": "lateral_forefoot",
+        "lateral_midfoot": "medial_midfoot",
+        "medial_midfoot": "lateral_midfoot",
+        "lateral_heel": "medial_heel",
+        "central_heel": "central_heel",
+        "medial_heel": "lateral_heel",
+    }
+    return {mapping[k]: v for k, v in right_scores.items()}
+
+def asymmetry_adjust_scores(left_scores: dict, right_scores: dict) -> tuple[dict, dict]:
+    mirrored_right = mirror_right_scores_to_left_frame(right_scores)
+
+    left_adj = left_scores.copy()
+    right_adj = right_scores.copy()
+
+    for left_zone, left_val in left_scores.items():
+        right_val = mirrored_right.get(left_zone, 0.0)
+        diff = left_val - right_val
+
+        if abs(diff) > 0.10:
+            if diff > 0:
+                left_adj[left_zone] = min(1.0, left_val + 0.10)
+            else:
+                mirrored_zone = {
+                    "lateral_forefoot": "medial_forefoot",
+                    "central_forefoot": "central_forefoot",
+                    "medial_forefoot": "lateral_forefoot",
+                    "lateral_midfoot": "medial_midfoot",
+                    "medial_midfoot": "lateral_midfoot",
+                    "lateral_heel": "medial_heel",
+                    "central_heel": "central_heel",
+                    "medial_heel": "lateral_heel",
+                }[left_zone]
+                right_adj[mirrored_zone] = min(1.0, right_scores.get(mirrored_zone, 0.0) + 0.10)
+
+    return left_adj, right_adj
+
+def top_wear_zones(scores: dict, threshold: float = 0.40):
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [name for name, score in ranked if score >= threshold][:4]
 
-def make_mask_overlay(base_bytes: bytes) -> tuple[str | None, dict]:
-    scores, img_bgr, sole_mask, wear_mask = compute_zone_wear_scores(base_bytes)
-
+def make_mask_overlay(img_bgr: np.ndarray, sole_mask: np.ndarray, wear_mask: np.ndarray) -> str:
     base_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGBA)
     overlay = np.zeros_like(base_rgba, dtype=np.uint8)
 
@@ -572,8 +603,7 @@ def make_mask_overlay(base_bytes: bytes) -> tuple[str | None, dict]:
     base_img = Image.fromarray(base_rgba, mode="RGBA")
     overlay_img = Image.fromarray(overlay, mode="RGBA")
     combined = Image.alpha_composite(base_img, overlay_img)
-
-    return img_to_data_url_pil(combined), scores
+    return img_to_data_url_pil(combined)
 
 def infer_pronation_from_scores(left_scores: dict, right_scores: dict):
     def side_result(scores: dict):
@@ -584,7 +614,7 @@ def infer_pronation_from_scores(left_scores: dict, right_scores: dict):
         diff = medial - lateral
         strength = max(medial, lateral, center)
 
-        if strength < 0.20:
+        if strength < 0.18:
             pronation = "unclear"
             confidence = 0.25
             notes = "Wear pattern is weak or not clearly distinguishable."
@@ -651,8 +681,16 @@ async def analyze(
         raise HTTPException(status_code=400, detail=f"Bad upload: {e}")
 
     try:
-        left_overlay, left_scores = make_mask_overlay(left_bytes)
-        right_overlay, right_scores = make_mask_overlay(right_bytes)
+        left_img, left_sole_mask, left_wear_mask = compute_wear_mask(left_bytes)
+        right_img, right_sole_mask, right_wear_mask = compute_wear_mask(right_bytes)
+
+        left_scores = compute_zone_wear_scores_from_masks(left_sole_mask, left_wear_mask)
+        right_scores = compute_zone_wear_scores_from_masks(right_sole_mask, right_wear_mask)
+
+        left_scores, right_scores = asymmetry_adjust_scores(left_scores, right_scores)
+
+        left_overlay = make_mask_overlay(left_img, left_sole_mask, left_wear_mask)
+        right_overlay = make_mask_overlay(right_img, right_sole_mask, right_wear_mask)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not analyse sole images: {e}")
 
