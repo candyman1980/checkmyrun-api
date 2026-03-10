@@ -15,12 +15,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://checkmyrun.com",
-        "https://www.checkmyrun.com",
-        "http://checkmyrun.com",
-        "*",
-    ],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -62,8 +57,11 @@ INDEX_HTML = """
       margin:0 0 10px 0;
       font-size:18px;
     }
+    .frameLabel{
+      display:block;
+      cursor:pointer;
+    }
     .previewBox{
-      margin-top:12px;
       min-height:220px;
       border:2px dashed #ddd;
       border-radius:10px;
@@ -72,10 +70,15 @@ INDEX_HTML = """
       justify-content:center;
       overflow:hidden;
       background:#fcfcfc;
+      transition:border-color 0.15s ease, background 0.15s ease;
+    }
+    .previewBox:hover{
+      border-color:#999;
+      background:#f7f7f7;
     }
     .previewBox img{
       max-width:100%;
-      max-height:320px;
+      max-height:360px;
       display:block;
     }
     .placeholder{
@@ -83,11 +86,17 @@ INDEX_HTML = """
       font-size:14px;
       text-align:center;
       padding:20px;
+      line-height:1.45;
     }
-    input[type=file]{
-      display:block;
-      margin-top:8px;
-      width:100%;
+    .hiddenFileInput{
+      display:none;
+    }
+    .fileMeta{
+      margin-top:10px;
+      font-size:13px;
+      color:#666;
+      min-height:18px;
+      word-break:break-word;
     }
     button{
       padding:10px 14px;
@@ -148,35 +157,44 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h1>CheckMyRun</h1>
-    <p>Upload clear photos of both soles and a rear photo. You’ll get a local wear analysis and wear overlays underneath.</p>
+    <p>Tap or click directly on each photo frame to choose an image. Wear detection now prioritises texture loss and difference from fresh rubber on the same sole.</p>
 
     <form id="form" enctype="multipart/form-data">
       <div class="uploadGrid">
         <div class="uploadCard">
           <h3>Left sole</h3>
-          <input id="leftInput" type="file" name="left" accept="image/*" required>
-          <div class="previewBox">
-            <img id="leftPreview" style="display:none" alt="Left preview">
-            <div id="leftPlaceholder" class="placeholder">Left sole image preview will appear here</div>
-          </div>
+          <label class="frameLabel" for="leftInput">
+            <div class="previewBox">
+              <img id="leftPreview" style="display:none" alt="Left preview">
+              <div id="leftPlaceholder" class="placeholder">Tap here to upload the left sole photo</div>
+            </div>
+          </label>
+          <input id="leftInput" class="hiddenFileInput" type="file" name="left" accept="image/*" required>
+          <div id="leftMeta" class="fileMeta"></div>
         </div>
 
         <div class="uploadCard">
           <h3>Right sole</h3>
-          <input id="rightInput" type="file" name="right" accept="image/*" required>
-          <div class="previewBox">
-            <img id="rightPreview" style="display:none" alt="Right preview">
-            <div id="rightPlaceholder" class="placeholder">Right sole image preview will appear here</div>
-          </div>
+          <label class="frameLabel" for="rightInput">
+            <div class="previewBox">
+              <img id="rightPreview" style="display:none" alt="Right preview">
+              <div id="rightPlaceholder" class="placeholder">Tap here to upload the right sole photo</div>
+            </div>
+          </label>
+          <input id="rightInput" class="hiddenFileInput" type="file" name="right" accept="image/*" required>
+          <div id="rightMeta" class="fileMeta"></div>
         </div>
 
         <div class="uploadCard">
           <h3>Rear photo</h3>
-          <input id="rearInput" type="file" name="rear" accept="image/*">
-          <div class="previewBox">
-            <img id="rearPreview" style="display:none" alt="Rear preview">
-            <div id="rearPlaceholder" class="placeholder">Rear photo preview will appear here</div>
-          </div>
+          <label class="frameLabel" for="rearInput">
+            <div class="previewBox">
+              <img id="rearPreview" style="display:none" alt="Rear preview">
+              <div id="rearPlaceholder" class="placeholder">Tap here to upload the rear photo (optional)</div>
+            </div>
+          </label>
+          <input id="rearInput" class="hiddenFileInput" type="file" name="rear" accept="image/*">
+          <div id="rearMeta" class="fileMeta"></div>
         </div>
       </div>
 
@@ -264,23 +282,29 @@ const leftPlaceholder = document.getElementById("leftPlaceholder");
 const rightPlaceholder = document.getElementById("rightPlaceholder");
 const rearPlaceholder = document.getElementById("rearPlaceholder");
 
+const leftMeta = document.getElementById("leftMeta");
+const rightMeta = document.getElementById("rightMeta");
+const rearMeta = document.getElementById("rearMeta");
+
 function prettyLabel(v) {
   if (!v) return "—";
   return String(v).replace(/_/g, " ").replace(/-/g, " ");
 }
 
-function showPreview(input, imgEl, placeholderEl) {
+function showPreview(input, imgEl, placeholderEl, metaEl) {
   const file = input.files && input.files[0];
   if (!file) {
     imgEl.style.display = "none";
     imgEl.src = "";
     placeholderEl.style.display = "block";
+    metaEl.textContent = "";
     return;
   }
   const url = URL.createObjectURL(file);
   imgEl.src = url;
   imgEl.style.display = "block";
   placeholderEl.style.display = "none";
+  metaEl.textContent = file.name;
 }
 
 function safeSetOverlay(container, dataUrl, altText) {
@@ -304,9 +328,9 @@ function safeSetOverlay(container, dataUrl, altText) {
   }
 }
 
-leftInput.addEventListener("change", () => showPreview(leftInput, leftPreview, leftPlaceholder));
-rightInput.addEventListener("change", () => showPreview(rightInput, rightPreview, rightPlaceholder));
-rearInput.addEventListener("change", () => showPreview(rearInput, rearPreview, rearPlaceholder));
+leftInput.addEventListener("change", () => showPreview(leftInput, leftPreview, leftPlaceholder, leftMeta));
+rightInput.addEventListener("change", () => showPreview(rightInput, rightPreview, rightPlaceholder, rightMeta));
+rearInput.addEventListener("change", () => showPreview(rearInput, rearPreview, rearPlaceholder, rearMeta));
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -406,7 +430,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V5"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V7"}
 
 def upload_to_bytes(upload: UploadFile) -> bytes:
     b = upload.file.read()
@@ -493,41 +517,74 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
 
     return img_bgr, sole_mask
 
+def estimate_fresh_rubber_reference(img_bgr: np.ndarray, sole_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    _, s_chan, v_chan = cv2.split(hsv)
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 45, 130)
+    edge_density = cv2.blur(edges, (11, 11))
+
+    colourful = cv2.inRange(s_chan, 45, 255)
+    not_dark = cv2.inRange(v_chan, 45, 255)
+    textured = cv2.inRange(edge_density, 10, 255)
+
+    fresh_mask = cv2.bitwise_and(colourful, not_dark)
+    fresh_mask = cv2.bitwise_and(fresh_mask, textured)
+    fresh_mask = cv2.bitwise_and(fresh_mask, sole_mask)
+
+    return hsv, fresh_mask
+
 def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     img_bgr, sole_mask = extract_sole_mask(base_bytes)
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    gray_eq = cv2.equalizeHist(gray)
+    hsv, fresh_mask = estimate_fresh_rubber_reference(img_bgr, sole_mask)
     _, s_chan, v_chan = cv2.split(hsv)
 
-    fresh_green_mask = cv2.inRange(hsv, (25, 45, 40), (95, 255, 255))
-    fresh_green_mask = cv2.bitwise_and(fresh_green_mask, sole_mask)
+    if cv2.countNonZero(fresh_mask) > 80:
+        fresh_mean_bgr = cv2.mean(img_bgr, mask=fresh_mask)[:3]
+        fresh_mean_gray = cv2.mean(gray_eq, mask=fresh_mask)[0]
+        fresh_mean_sat = cv2.mean(s_chan, mask=fresh_mask)[0]
 
-    if cv2.countNonZero(fresh_green_mask) > 50:
-        mean_bgr = cv2.mean(img_bgr, mask=fresh_green_mask)[:3]
-        ref = np.array(mean_bgr, dtype=np.float32).reshape(1, 1, 3)
-        diff = np.sqrt(np.sum((img_bgr.astype(np.float32) - ref) ** 2, axis=2))
-        diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        ref = np.array(fresh_mean_bgr, dtype=np.float32).reshape(1, 1, 3)
+        colour_diff = np.sqrt(np.sum((img_bgr.astype(np.float32) - ref) ** 2, axis=2))
+        colour_diff = cv2.normalize(colour_diff, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        sat_delta = np.clip((fresh_mean_sat - s_chan).astype(np.float32), 0, 255).astype(np.uint8)
+        bright_delta = cv2.absdiff(gray_eq, np.full_like(gray_eq, int(fresh_mean_gray)))
     else:
-        diff = np.zeros_like(gray)
+        colour_diff = np.zeros_like(gray_eq)
+        sat_delta = np.zeros_like(gray_eq)
+        bright_delta = np.zeros_like(gray_eq)
 
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 40, 120)
-    edge_density = cv2.blur(edges, (21, 21))
-    low_edges = cv2.inRange(edge_density, 0, 18)
+    blur = cv2.GaussianBlur(gray_eq, (5, 5), 0)
 
-    low_sat = cv2.inRange(s_chan, 0, 115)
-    non_green = cv2.inRange(diff, 35, 255)
-    not_too_dark = cv2.inRange(v_chan, 55, 245)
+    # texture loss is the main signal
+    edges = cv2.Canny(blur, 35, 110)
+    edge_density = cv2.blur(edges, (17, 17))
+    low_edges = cv2.inRange(edge_density, 0, 34)
 
-    wear_candidate = cv2.bitwise_and(low_sat, non_green)
-    wear_candidate = cv2.bitwise_and(wear_candidate, not_too_dark)
-    wear_candidate = cv2.bitwise_and(wear_candidate, low_edges)
+    lap = cv2.Laplacian(blur, cv2.CV_32F)
+    lap_abs = cv2.convertScaleAbs(lap)
+    local_texture = cv2.blur(lap_abs, (13, 13))
+    low_texture = cv2.inRange(local_texture, 0, 20)
+
+    less_saturated = cv2.inRange(sat_delta, 14, 255)
+    different_from_fresh = cv2.inRange(colour_diff, 16, 255)
+    brightness_changed = cv2.inRange(bright_delta, 10, 255)
+    visible_enough = cv2.inRange(v_chan, 40, 245)
+
+    texture_branch = cv2.bitwise_and(low_edges, low_texture)
+    change_branch = cv2.bitwise_and(less_saturated, different_from_fresh)
+    change_branch = cv2.bitwise_or(change_branch, brightness_changed)
+
+    wear_candidate = cv2.bitwise_and(texture_branch, change_branch)
+    wear_candidate = cv2.bitwise_and(wear_candidate, visible_enough)
     wear_candidate = cv2.bitwise_and(wear_candidate, sole_mask)
 
-    inner_mask = cv2.erode(sole_mask, np.ones((17, 17), np.uint8), iterations=1)
+    inner_mask = cv2.erode(sole_mask, np.ones((13, 13), np.uint8), iterations=1)
     wear_candidate = cv2.bitwise_and(wear_candidate, inner_mask)
 
     kernel_small = np.ones((5, 5), np.uint8)
@@ -539,7 +596,7 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
 
     contours, _ = cv2.findContours(wear_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     wear_mask = np.zeros_like(wear_candidate)
-    min_area = max(50, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.00035))
+    min_area = max(28, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.00016))
 
     for c in contours:
         area = cv2.contourArea(c)
@@ -627,7 +684,7 @@ def asymmetry_adjust_scores(left_scores: dict, right_scores: dict) -> tuple[dict
 
     return left_adj, right_adj
 
-def top_wear_zones(scores: dict, threshold: float = 0.22):
+def top_wear_zones(scores: dict, threshold: float = 0.16):
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [name for name, score in ranked if score >= threshold][:5]
 
@@ -636,12 +693,12 @@ def make_mask_overlay(img_bgr: np.ndarray, sole_mask: np.ndarray, wear_mask: np.
     overlay = np.zeros_like(base_rgba, dtype=np.uint8)
 
     overlay[..., 0] = 255
-    overlay[..., 1] = 85
-    overlay[..., 2] = 25
-    overlay[..., 3] = np.where(wear_mask > 0, 165, 0).astype(np.uint8)
+    overlay[..., 1] = 95
+    overlay[..., 2] = 30
+    overlay[..., 3] = np.where(wear_mask > 0, 178, 0).astype(np.uint8)
 
     alpha = overlay[..., 3]
-    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=3.5, sigmaY=3.5)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=3.0, sigmaY=3.0)
     overlay[..., 3] = alpha
 
     contours, _ = cv2.findContours(sole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -662,7 +719,7 @@ def infer_pronation_from_scores(left_scores: dict, right_scores: dict):
         diff = medial - lateral
         strength = max(medial, lateral, center)
 
-        if strength < 0.15:
+        if strength < 0.12:
             pronation = "unclear"
             confidence = 0.25
             notes = "Wear pattern is weak or not clearly distinguishable."
