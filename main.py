@@ -406,7 +406,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V3"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V5"}
 
 def upload_to_bytes(upload: UploadFile) -> bytes:
     b = upload.file.read()
@@ -423,7 +423,11 @@ def resize_for_processing(img_bgr: np.ndarray, max_size: int = 900) -> np.ndarra
     h, w = img_bgr.shape[:2]
     scale = max_size / max(h, w)
     if scale < 1:
-        img_bgr = cv2.resize(img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        img_bgr = cv2.resize(
+            img_bgr,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
     return img_bgr
 
 def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
@@ -437,10 +441,10 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
 
     mask = np.zeros((h, w), np.uint8)
     rect = (
-        int(w * 0.10),
-        int(h * 0.04),
-        int(w * 0.80),
-        int(h * 0.88),
+        int(w * 0.12),
+        int(h * 0.03),
+        int(w * 0.76),
+        int(h * 0.82),
     )
 
     bgd_model = np.zeros((1, 65), np.float64)
@@ -457,17 +461,33 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
         gc_mask = np.zeros((h, w), np.uint8)
         gc_mask[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]] = 255
 
-    gc_mask[int(h * 0.96):, :] = 0
+    gc_mask[int(h * 0.90):, :] = 0
+
+    corner_mask = np.ones_like(gc_mask) * 255
+    cv2.rectangle(corner_mask, (0, int(h * 0.78)), (int(w * 0.16), h), 0, -1)
+    cv2.rectangle(corner_mask, (int(w * 0.84), int(h * 0.78)), (w, h), 0, -1)
+    gc_mask = cv2.bitwise_and(gc_mask, corner_mask)
 
     contours, _ = cv2.findContours(gc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    sole_mask = np.zeros_like(gc_mask)
+
     if contours:
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        sole_mask = np.zeros_like(gc_mask)
-        cv2.drawContours(sole_mask, [contours[0]], -1, 255, thickness=cv2.FILLED)
+        best = None
+        for c in contours:
+            x, y, cw, ch = cv2.boundingRect(c)
+            cy = y + ch / 2
+            area = cv2.contourArea(c)
+            if area > (h * w * 0.08) and cy < h * 0.72:
+                best = c
+                break
+        if best is None:
+            best = contours[0]
+        cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
     else:
         sole_mask = gc_mask
 
-    kernel = np.ones((7, 7), np.uint8)
+    kernel = np.ones((9, 9), np.uint8)
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, kernel)
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, kernel)
 
@@ -478,29 +498,55 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # True-wear signal: low edge density + relatively brighter smooth rubber.
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    _, s_chan, v_chan = cv2.split(hsv)
+
+    fresh_green_mask = cv2.inRange(hsv, (25, 45, 40), (95, 255, 255))
+    fresh_green_mask = cv2.bitwise_and(fresh_green_mask, sole_mask)
+
+    if cv2.countNonZero(fresh_green_mask) > 50:
+        mean_bgr = cv2.mean(img_bgr, mask=fresh_green_mask)[:3]
+        ref = np.array(mean_bgr, dtype=np.float32).reshape(1, 1, 3)
+        diff = np.sqrt(np.sum((img_bgr.astype(np.float32) - ref) ** 2, axis=2))
+        diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    else:
+        diff = np.zeros_like(gray)
+
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 40, 120)
     edge_density = cv2.blur(edges, (21, 21))
-    low_edges = cv2.inRange(edge_density, 0, 12)
-    bright = cv2.inRange(gray, 110, 255)
+    low_edges = cv2.inRange(edge_density, 0, 18)
 
-    wear_candidate = cv2.bitwise_and(low_edges, bright)
+    low_sat = cv2.inRange(s_chan, 0, 115)
+    non_green = cv2.inRange(diff, 35, 255)
+    not_too_dark = cv2.inRange(v_chan, 55, 245)
+
+    wear_candidate = cv2.bitwise_and(low_sat, non_green)
+    wear_candidate = cv2.bitwise_and(wear_candidate, not_too_dark)
+    wear_candidate = cv2.bitwise_and(wear_candidate, low_edges)
     wear_candidate = cv2.bitwise_and(wear_candidate, sole_mask)
 
-    kernel = np.ones((5, 5), np.uint8)
-    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_OPEN, kernel)
-    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_CLOSE, kernel)
+    inner_mask = cv2.erode(sole_mask, np.ones((17, 17), np.uint8), iterations=1)
+    wear_candidate = cv2.bitwise_and(wear_candidate, inner_mask)
+
+    kernel_small = np.ones((5, 5), np.uint8)
+    kernel_med = np.ones((9, 9), np.uint8)
+
+    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_OPEN, kernel_small)
+    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_CLOSE, kernel_med)
+    wear_candidate = cv2.dilate(wear_candidate, kernel_small, iterations=1)
 
     contours, _ = cv2.findContours(wear_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     wear_mask = np.zeros_like(wear_candidate)
-    min_area = max(80, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.0008))
+    min_area = max(50, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.00035))
+
     for c in contours:
         area = cv2.contourArea(c)
         if area >= min_area:
             cv2.drawContours(wear_mask, [c], -1, 255, thickness=cv2.FILLED)
 
+    wear_mask = cv2.bitwise_and(wear_mask, inner_mask)
     return img_bgr, sole_mask, wear_mask
 
 def zone_score_from_mask(mask: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
@@ -557,6 +603,17 @@ def asymmetry_adjust_scores(left_scores: dict, right_scores: dict) -> tuple[dict
     left_adj = left_scores.copy()
     right_adj = right_scores.copy()
 
+    reverse_map = {
+        "lateral_forefoot": "medial_forefoot",
+        "central_forefoot": "central_forefoot",
+        "medial_forefoot": "lateral_forefoot",
+        "lateral_midfoot": "medial_midfoot",
+        "medial_midfoot": "lateral_midfoot",
+        "lateral_heel": "medial_heel",
+        "central_heel": "central_heel",
+        "medial_heel": "lateral_heel",
+    }
+
     for left_zone, left_val in left_scores.items():
         right_val = mirrored_right.get(left_zone, 0.0)
         diff = left_val - right_val
@@ -565,35 +622,26 @@ def asymmetry_adjust_scores(left_scores: dict, right_scores: dict) -> tuple[dict
             if diff > 0:
                 left_adj[left_zone] = min(1.0, left_val + 0.10)
             else:
-                mirrored_zone = {
-                    "lateral_forefoot": "medial_forefoot",
-                    "central_forefoot": "central_forefoot",
-                    "medial_forefoot": "lateral_forefoot",
-                    "lateral_midfoot": "medial_midfoot",
-                    "medial_midfoot": "lateral_midfoot",
-                    "lateral_heel": "medial_heel",
-                    "central_heel": "central_heel",
-                    "medial_heel": "lateral_heel",
-                }[left_zone]
-                right_adj[mirrored_zone] = min(1.0, right_scores.get(mirrored_zone, 0.0) + 0.10)
+                rz = reverse_map[left_zone]
+                right_adj[rz] = min(1.0, right_scores.get(rz, 0.0) + 0.10)
 
     return left_adj, right_adj
 
-def top_wear_zones(scores: dict, threshold: float = 0.40):
+def top_wear_zones(scores: dict, threshold: float = 0.22):
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    return [name for name, score in ranked if score >= threshold][:4]
+    return [name for name, score in ranked if score >= threshold][:5]
 
 def make_mask_overlay(img_bgr: np.ndarray, sole_mask: np.ndarray, wear_mask: np.ndarray) -> str:
     base_rgba = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGBA)
     overlay = np.zeros_like(base_rgba, dtype=np.uint8)
 
     overlay[..., 0] = 255
-    overlay[..., 1] = 45
-    overlay[..., 2] = 0
-    overlay[..., 3] = np.where(wear_mask > 0, 130, 0).astype(np.uint8)
+    overlay[..., 1] = 85
+    overlay[..., 2] = 25
+    overlay[..., 3] = np.where(wear_mask > 0, 165, 0).astype(np.uint8)
 
     alpha = overlay[..., 3]
-    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=4, sigmaY=4)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=3.5, sigmaY=3.5)
     overlay[..., 3] = alpha
 
     contours, _ = cv2.findContours(sole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -614,15 +662,15 @@ def infer_pronation_from_scores(left_scores: dict, right_scores: dict):
         diff = medial - lateral
         strength = max(medial, lateral, center)
 
-        if strength < 0.18:
+        if strength < 0.15:
             pronation = "unclear"
             confidence = 0.25
             notes = "Wear pattern is weak or not clearly distinguishable."
-        elif diff > 0.12:
+        elif diff > 0.10:
             pronation = "overpronation"
             confidence = min(0.9, 0.45 + diff + strength * 0.25)
             notes = "More wear appears on medial zones, suggesting inward roll."
-        elif diff < -0.12:
+        elif diff < -0.10:
             pronation = "underpronation"
             confidence = min(0.9, 0.45 + abs(diff) + strength * 0.25)
             notes = "More wear appears on lateral zones, suggesting outward loading."
