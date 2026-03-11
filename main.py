@@ -157,7 +157,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h1>CheckMyRun</h1>
-    <p>Tap or click directly on each photo frame to choose an image. Wear regions are merged to show a clearer overall pattern.</p>
+    <p>Tap or click directly on each photo frame to choose an image.</p>
 
     <form id="form" enctype="multipart/form-data">
       <div class="uploadGrid">
@@ -417,7 +417,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V8"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V9"}
 
 def upload_to_bytes(upload: UploadFile) -> bytes:
     b = upload.file.read()
@@ -451,40 +451,33 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     h, w = img_bgr.shape[:2]
 
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    _, s_chan, v_chan = cv2.split(hsv)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    _, s_chan, v_chan = cv2.split(hsv)
 
-    # Colour-rich outsole regions
-    colour_mask = cv2.inRange(s_chan, 28, 255)
+    # Strict central search window: this is where the sole should be.
+    roi_mask = np.zeros((h, w), np.uint8)
+    x0 = int(w * 0.18)
+    x1 = int(w * 0.82)
+    y0 = int(h * 0.02)
+    y1 = int(h * 0.90)
+    roi_mask[y0:y1, x0:x1] = 255
 
-    # Tread texture
-    edges = cv2.Canny(gray, 35, 130)
+    # Signals that belong to outsole rather than background
+    colour_mask = cv2.inRange(s_chan, 22, 255)
+    visible_mask = cv2.inRange(v_chan, 35, 255)
+
+    edges = cv2.Canny(gray, 35, 125)
     edge_density = cv2.blur(edges, (13, 13))
-    texture_mask = cv2.inRange(edge_density, 8, 255)
+    texture_mask = cv2.inRange(edge_density, 6, 255)
 
-    # Visible enough
-    bright_mask = cv2.inRange(v_chan, 35, 255)
+    # Combine within the central corridor only
+    mask = cv2.bitwise_and(cv2.bitwise_or(colour_mask, texture_mask), visible_mask)
+    mask = cv2.bitwise_and(mask, roi_mask)
 
-    # Base combined mask
-    mask = cv2.bitwise_and(colour_mask, bright_mask)
-    mask = cv2.bitwise_or(mask, texture_mask)
-
-    # Central prior to favour the shoe over background
-    central_prior = np.zeros_like(mask)
-    cv2.ellipse(
-        central_prior,
-        (w // 2, int(h * 0.47)),
-        (int(w * 0.26), int(h * 0.42)),
-        0,
-        0,
-        360,
-        255,
-        -1,
-    )
-    mask = cv2.bitwise_and(mask, cv2.bitwise_or(central_prior, texture_mask))
-
-    # Hard removal of very bottom band / hand area
-    mask[int(h * 0.92):, :] = 0
+    # Suppress bottom-most band and side intrusions
+    mask[int(h * 0.91):, :] = 0
+    cv2.rectangle(mask, (0, 0), (int(w * 0.14), h), 0, -1)
+    cv2.rectangle(mask, (int(w * 0.86), 0), (w, h), 0, -1)
 
     kernel = np.ones((9, 9), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -493,34 +486,41 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     sole_mask = np.zeros_like(mask)
 
-    if contours:
-        best = None
-        best_score = -1.0
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < h * w * 0.05:
-                continue
-            x, y, cw, ch = cv2.boundingRect(c)
-            cx = x + cw / 2.0
-            cy = y + ch / 2.0
-            # prefer big, tall, central contours
-            score = area
-            score *= 1.0 - min(0.9, abs(cx - (w / 2.0)) / (w / 2.0))
-            score *= 1.0 - min(0.9, abs(cy - (h * 0.5)) / (h * 0.5))
-            score *= max(0.5, min(2.0, ch / max(cw, 1)))
-            if score > best_score:
-                best_score = score
-                best = c
+    best = None
+    best_score = -1.0
 
-        if best is not None:
-            cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < h * w * 0.05:
+            continue
 
-    if cv2.countNonZero(sole_mask) == 0:
-        # conservative fallback central ellipse
+        x, y, cw, ch = cv2.boundingRect(c)
+        cx = x + cw / 2.0
+        cy = y + ch / 2.0
+        aspect = ch / max(cw, 1)
+
+        if aspect < 1.15:
+            continue
+        if cy > h * 0.70:
+            continue
+
+        center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
+        vertical_score = 1.0 - abs(cy - (h * 0.46)) / (h * 0.46)
+
+        score = area * max(0.1, center_score) * max(0.1, vertical_score) * min(2.0, aspect)
+
+        if score > best_score:
+            best_score = score
+            best = c
+
+    if best is not None:
+        cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
+    else:
+        # Conservative fallback ellipse
         cv2.ellipse(
             sole_mask,
-            (w // 2, int(h * 0.47)),
-            (int(w * 0.24), int(h * 0.40)),
+            (w // 2, int(h * 0.45)),
+            (int(w * 0.18), int(h * 0.37)),
             0,
             0,
             360,
@@ -528,14 +528,12 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
             -1,
         )
 
-    # smooth and slightly fill the outline
-    kernel_big = np.ones((11, 11), np.uint8)
-    sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, kernel_big)
-    sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, kernel)
+    sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
+    sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
     sole_mask = cv2.dilate(sole_mask, np.ones((5, 5), np.uint8), iterations=1)
 
-    # trim the bottom-most strip again to avoid hand
-    sole_mask[int(h * 0.965):, :] = 0
+    # Final trim to keep out the hand
+    sole_mask[int(h * 0.955):, :] = 0
 
     return img_bgr, sole_mask
 
@@ -583,7 +581,6 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
 
     blur = cv2.GaussianBlur(gray_eq, (5, 5), 0)
 
-    # texture loss is primary
     edges = cv2.Canny(blur, 35, 110)
     edge_density = cv2.blur(edges, (17, 17))
     low_edges = cv2.inRange(edge_density, 0, 34)
@@ -609,7 +606,6 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
     inner_mask = cv2.erode(sole_mask, np.ones((11, 11), np.uint8), iterations=1)
     wear_candidate = cv2.bitwise_and(wear_candidate, inner_mask)
 
-    # merge nearby hotspots into broader wear regions
     wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
     wear_candidate = cv2.dilate(wear_candidate, np.ones((7, 7), np.uint8), iterations=1)
