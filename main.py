@@ -1,5 +1,6 @@
 import base64
 import io
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -8,6 +9,8 @@ from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+
+from rembg import remove, new_session
 
 cv2.setNumThreads(1)
 
@@ -411,13 +414,18 @@ ZONE_RECTS = {
     "medial_heel": (0.55, 0.68, 1.00, 1.00),
 }
 
+@lru_cache(maxsize=1)
+def get_rembg_session():
+    # u2netp is the lighter model
+    return new_session("u2netp")
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     return HTMLResponse(content=INDEX_HTML, status_code=200)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V9"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "SEGMENT-WEAR-V1"}
 
 def upload_to_bytes(upload: UploadFile) -> bytes:
     b = upload.file.read()
@@ -441,6 +449,52 @@ def resize_for_processing(img_bgr: np.ndarray, max_size: int = 900) -> np.ndarra
         )
     return img_bgr
 
+def run_rembg_alpha(base_bytes: bytes) -> np.ndarray:
+    session = get_rembg_session()
+    out_bytes = remove(base_bytes, session=session)
+    rgba = Image.open(io.BytesIO(out_bytes)).convert("RGBA")
+    alpha = np.array(rgba)[..., 3]
+    return alpha
+
+def contour_shape_score(contour, img_shape) -> float:
+    h, w = img_shape[:2]
+    area = cv2.contourArea(contour)
+    if area <= 0:
+        return -1e9
+
+    x, y, cw, ch = cv2.boundingRect(contour)
+    cx = x + cw / 2.0
+    cy = y + ch / 2.0
+
+    aspect = ch / max(cw, 1)
+    hull = cv2.convexHull(contour)
+    hull_area = max(cv2.contourArea(hull), 1.0)
+    solidity = area / hull_area
+    perimeter = max(cv2.arcLength(contour, True), 1.0)
+    compactness = 4.0 * np.pi * area / (perimeter * perimeter)
+
+    center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
+    vertical_score = 1.0 - abs(cy - (h * 0.46)) / (h * 0.46)
+
+    if aspect < 1.1:
+        return -1e9
+    if area < h * w * 0.04:
+        return -1e9
+    if y > h * 0.20:
+        return -1e9
+    if (y + ch) < h * 0.70:
+        return -1e9
+
+    score = 0.0
+    score += area / (h * w)
+    score += 1.6 * max(0.0, min(1.5, center_score))
+    score += 1.1 * max(0.0, min(1.5, vertical_score))
+    score += 1.2 * min(2.4, aspect)
+    score += 1.0 * max(0.0, solidity)
+    score += 0.5 * max(0.0, compactness)
+
+    return score
+
 def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     arr = np.frombuffer(base_bytes, np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -450,77 +504,46 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     img_bgr = resize_for_processing(img_bgr, max_size=900)
     h, w = img_bgr.shape[:2]
 
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    _, s_chan, v_chan = cv2.split(hsv)
+    # run segmentation model on resized image bytes
+    ok, enc = cv2.imencode(".png", img_bgr)
+    if not ok:
+        raise ValueError("Could not encode image for segmentation")
+    alpha = run_rembg_alpha(enc.tobytes())
 
-    # Strict central search window: this is where the sole should be.
-    roi_mask = np.zeros((h, w), np.uint8)
-    x0 = int(w * 0.18)
-    x1 = int(w * 0.82)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    seg_mask = cv2.inRange(alpha, 20, 255)
+
+    # hard constraints: central sole corridor, exclude hand-heavy lower corners
+    corridor = np.zeros_like(seg_mask)
+    x0 = int(w * 0.20)
+    x1 = int(w * 0.80)
     y0 = int(h * 0.02)
-    y1 = int(h * 0.90)
-    roi_mask[y0:y1, x0:x1] = 255
+    y1 = int(h * 0.93)
+    corridor[y0:y1, x0:x1] = 255
 
-    # Signals that belong to outsole rather than background
-    colour_mask = cv2.inRange(s_chan, 22, 255)
-    visible_mask = cv2.inRange(v_chan, 35, 255)
+    seg_mask = cv2.bitwise_and(seg_mask, corridor)
 
-    edges = cv2.Canny(gray, 35, 125)
-    edge_density = cv2.blur(edges, (13, 13))
-    texture_mask = cv2.inRange(edge_density, 6, 255)
-
-    # Combine within the central corridor only
-    mask = cv2.bitwise_and(cv2.bitwise_or(colour_mask, texture_mask), visible_mask)
-    mask = cv2.bitwise_and(mask, roi_mask)
-
-    # Suppress bottom-most band and side intrusions
-    mask[int(h * 0.91):, :] = 0
-    cv2.rectangle(mask, (0, 0), (int(w * 0.14), h), 0, -1)
-    cv2.rectangle(mask, (int(w * 0.86), 0), (w, h), 0, -1)
+    # remove obvious bottom hand/watch region
+    seg_mask[int(h * 0.955):, :] = 0
 
     kernel = np.ones((9, 9), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_CLOSE, kernel)
+    seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_OPEN, kernel)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    sole_mask = np.zeros_like(mask)
+    contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    sole_mask = np.zeros_like(seg_mask)
 
-    best = None
-    best_score = -1.0
+    if contours:
+        best = max(contours, key=lambda c: contour_shape_score(c, img_bgr.shape))
+        if contour_shape_score(best, img_bgr.shape) > -1e8:
+            cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
 
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < h * w * 0.05:
-            continue
-
-        x, y, cw, ch = cv2.boundingRect(c)
-        cx = x + cw / 2.0
-        cy = y + ch / 2.0
-        aspect = ch / max(cw, 1)
-
-        if aspect < 1.15:
-            continue
-        if cy > h * 0.70:
-            continue
-
-        center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
-        vertical_score = 1.0 - abs(cy - (h * 0.46)) / (h * 0.46)
-
-        score = area * max(0.1, center_score) * max(0.1, vertical_score) * min(2.0, aspect)
-
-        if score > best_score:
-            best_score = score
-            best = c
-
-    if best is not None:
-        cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
-    else:
-        # Conservative fallback ellipse
+    if cv2.countNonZero(sole_mask) == 0:
+        # conservative fallback
         cv2.ellipse(
             sole_mask,
-            (w // 2, int(h * 0.45)),
-            (int(w * 0.18), int(h * 0.37)),
+            (w // 2, int(h * 0.47)),
+            (int(w * 0.18), int(h * 0.36)),
             0,
             0,
             360,
@@ -531,9 +554,7 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
     sole_mask = cv2.dilate(sole_mask, np.ones((5, 5), np.uint8), iterations=1)
-
-    # Final trim to keep out the hand
-    sole_mask[int(h * 0.955):, :] = 0
+    sole_mask[int(h * 0.965):, :] = 0
 
     return img_bgr, sole_mask
 
