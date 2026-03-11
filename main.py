@@ -157,7 +157,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h1>CheckMyRun</h1>
-    <p>Tap or click directly on each photo frame to choose an image. Wear detection now prioritises texture loss and difference from fresh rubber on the same sole.</p>
+    <p>Tap or click directly on each photo frame to choose an image. Wear regions are merged to show a clearer overall pattern.</p>
 
     <form id="form" enctype="multipart/form-data">
       <div class="uploadGrid">
@@ -223,11 +223,6 @@ INDEX_HTML = """
           <h3>Overall</h3>
           <div id="overallResult"></div>
         </div>
-
-        <div class="result-card">
-          <h3>Photo quality</h3>
-          <div id="qualityResult"></div>
-        </div>
       </div>
 
       <h2 class="sectionTitle">Wear overlays</h2>
@@ -265,7 +260,6 @@ const summary = document.getElementById("summary");
 const leftResult = document.getElementById("leftResult");
 const rightResult = document.getElementById("rightResult");
 const overallResult = document.getElementById("overallResult");
-const qualityResult = document.getElementById("qualityResult");
 const leftHeatmapWrap = document.getElementById("leftHeatmapWrap");
 const rightHeatmapWrap = document.getElementById("rightHeatmapWrap");
 const jsonOut = document.getElementById("json");
@@ -341,7 +335,6 @@ form.addEventListener("submit", async (e) => {
   leftResult.innerHTML = "";
   rightResult.innerHTML = "";
   overallResult.innerHTML = "";
-  qualityResult.innerHTML = "";
   leftHeatmapWrap.innerHTML = '<span class="muted">No overlay returned yet.</span>';
   rightHeatmapWrap.innerHTML = '<span class="muted">No overlay returned yet.</span>';
   jsonOut.textContent = "";
@@ -387,12 +380,6 @@ form.addEventListener("submit", async (e) => {
       <p><strong>Confidence:</strong> ${Math.round((data.overall?.confidence || 0) * 100)}%</p>
     `;
 
-    qualityResult.innerHTML = `
-      <p><strong>OK:</strong> ${data.photo_quality?.ok ? "Yes" : "No"}</p>
-      <p><strong>Issues:</strong></p>
-      <ul>${(data.photo_quality?.issues || []).map(i => `<li>${i}</li>`).join("") || "<li>None</li>"}</ul>
-    `;
-
     safeSetOverlay(leftHeatmapWrap, data.left_heatmap_data_url, "Left overlay");
     safeSetOverlay(rightHeatmapWrap, data.right_heatmap_data_url, "Right overlay");
 
@@ -430,7 +417,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V7"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "LOCAL-WEAR-V8"}
 
 def upload_to_bytes(upload: UploadFile) -> bytes:
     b = upload.file.read()
@@ -463,57 +450,92 @@ def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
     img_bgr = resize_for_processing(img_bgr, max_size=900)
     h, w = img_bgr.shape[:2]
 
-    mask = np.zeros((h, w), np.uint8)
-    rect = (
-        int(w * 0.12),
-        int(h * 0.03),
-        int(w * 0.76),
-        int(h * 0.82),
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    _, s_chan, v_chan = cv2.split(hsv)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Colour-rich outsole regions
+    colour_mask = cv2.inRange(s_chan, 28, 255)
+
+    # Tread texture
+    edges = cv2.Canny(gray, 35, 130)
+    edge_density = cv2.blur(edges, (13, 13))
+    texture_mask = cv2.inRange(edge_density, 8, 255)
+
+    # Visible enough
+    bright_mask = cv2.inRange(v_chan, 35, 255)
+
+    # Base combined mask
+    mask = cv2.bitwise_and(colour_mask, bright_mask)
+    mask = cv2.bitwise_or(mask, texture_mask)
+
+    # Central prior to favour the shoe over background
+    central_prior = np.zeros_like(mask)
+    cv2.ellipse(
+        central_prior,
+        (w // 2, int(h * 0.47)),
+        (int(w * 0.26), int(h * 0.42)),
+        0,
+        0,
+        360,
+        255,
+        -1,
     )
+    mask = cv2.bitwise_and(mask, cv2.bitwise_or(central_prior, texture_mask))
 
-    bgd_model = np.zeros((1, 65), np.float64)
-    fgd_model = np.zeros((1, 65), np.float64)
-
-    try:
-        cv2.grabCut(img_bgr, mask, rect, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_RECT)
-        gc_mask = np.where(
-            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
-            255,
-            0
-        ).astype("uint8")
-    except Exception:
-        gc_mask = np.zeros((h, w), np.uint8)
-        gc_mask[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]] = 255
-
-    gc_mask[int(h * 0.90):, :] = 0
-
-    corner_mask = np.ones_like(gc_mask) * 255
-    cv2.rectangle(corner_mask, (0, int(h * 0.78)), (int(w * 0.16), h), 0, -1)
-    cv2.rectangle(corner_mask, (int(w * 0.84), int(h * 0.78)), (w, h), 0, -1)
-    gc_mask = cv2.bitwise_and(gc_mask, corner_mask)
-
-    contours, _ = cv2.findContours(gc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    sole_mask = np.zeros_like(gc_mask)
-
-    if contours:
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        best = None
-        for c in contours:
-            x, y, cw, ch = cv2.boundingRect(c)
-            cy = y + ch / 2
-            area = cv2.contourArea(c)
-            if area > (h * w * 0.08) and cy < h * 0.72:
-                best = c
-                break
-        if best is None:
-            best = contours[0]
-        cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
-    else:
-        sole_mask = gc_mask
+    # Hard removal of very bottom band / hand area
+    mask[int(h * 0.92):, :] = 0
 
     kernel = np.ones((9, 9), np.uint8)
-    sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    sole_mask = np.zeros_like(mask)
+
+    if contours:
+        best = None
+        best_score = -1.0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < h * w * 0.05:
+                continue
+            x, y, cw, ch = cv2.boundingRect(c)
+            cx = x + cw / 2.0
+            cy = y + ch / 2.0
+            # prefer big, tall, central contours
+            score = area
+            score *= 1.0 - min(0.9, abs(cx - (w / 2.0)) / (w / 2.0))
+            score *= 1.0 - min(0.9, abs(cy - (h * 0.5)) / (h * 0.5))
+            score *= max(0.5, min(2.0, ch / max(cw, 1)))
+            if score > best_score:
+                best_score = score
+                best = c
+
+        if best is not None:
+            cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
+
+    if cv2.countNonZero(sole_mask) == 0:
+        # conservative fallback central ellipse
+        cv2.ellipse(
+            sole_mask,
+            (w // 2, int(h * 0.47)),
+            (int(w * 0.24), int(h * 0.40)),
+            0,
+            0,
+            360,
+            255,
+            -1,
+        )
+
+    # smooth and slightly fill the outline
+    kernel_big = np.ones((11, 11), np.uint8)
+    sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, kernel_big)
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, kernel)
+    sole_mask = cv2.dilate(sole_mask, np.ones((5, 5), np.uint8), iterations=1)
+
+    # trim the bottom-most strip again to avoid hand
+    sole_mask[int(h * 0.965):, :] = 0
 
     return img_bgr, sole_mask
 
@@ -561,7 +583,7 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
 
     blur = cv2.GaussianBlur(gray_eq, (5, 5), 0)
 
-    # texture loss is the main signal
+    # texture loss is primary
     edges = cv2.Canny(blur, 35, 110)
     edge_density = cv2.blur(edges, (17, 17))
     low_edges = cv2.inRange(edge_density, 0, 34)
@@ -569,12 +591,12 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
     lap = cv2.Laplacian(blur, cv2.CV_32F)
     lap_abs = cv2.convertScaleAbs(lap)
     local_texture = cv2.blur(lap_abs, (13, 13))
-    low_texture = cv2.inRange(local_texture, 0, 20)
+    low_texture = cv2.inRange(local_texture, 0, 22)
 
-    less_saturated = cv2.inRange(sat_delta, 14, 255)
-    different_from_fresh = cv2.inRange(colour_diff, 16, 255)
-    brightness_changed = cv2.inRange(bright_delta, 10, 255)
-    visible_enough = cv2.inRange(v_chan, 40, 245)
+    less_saturated = cv2.inRange(sat_delta, 12, 255)
+    different_from_fresh = cv2.inRange(colour_diff, 14, 255)
+    brightness_changed = cv2.inRange(bright_delta, 8, 255)
+    visible_enough = cv2.inRange(v_chan, 35, 245)
 
     texture_branch = cv2.bitwise_and(low_edges, low_texture)
     change_branch = cv2.bitwise_and(less_saturated, different_from_fresh)
@@ -584,19 +606,19 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
     wear_candidate = cv2.bitwise_and(wear_candidate, visible_enough)
     wear_candidate = cv2.bitwise_and(wear_candidate, sole_mask)
 
-    inner_mask = cv2.erode(sole_mask, np.ones((13, 13), np.uint8), iterations=1)
+    inner_mask = cv2.erode(sole_mask, np.ones((11, 11), np.uint8), iterations=1)
     wear_candidate = cv2.bitwise_and(wear_candidate, inner_mask)
 
-    kernel_small = np.ones((5, 5), np.uint8)
-    kernel_med = np.ones((9, 9), np.uint8)
-
-    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_OPEN, kernel_small)
-    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_CLOSE, kernel_med)
-    wear_candidate = cv2.dilate(wear_candidate, kernel_small, iterations=1)
+    # merge nearby hotspots into broader wear regions
+    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    wear_candidate = cv2.morphologyEx(wear_candidate, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
+    wear_candidate = cv2.dilate(wear_candidate, np.ones((7, 7), np.uint8), iterations=1)
+    wear_candidate = cv2.GaussianBlur(wear_candidate, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    wear_candidate = cv2.inRange(wear_candidate, 20, 255)
 
     contours, _ = cv2.findContours(wear_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     wear_mask = np.zeros_like(wear_candidate)
-    min_area = max(28, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.00016))
+    min_area = max(40, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.00020))
 
     for c in contours:
         area = cv2.contourArea(c)
@@ -604,6 +626,7 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
             cv2.drawContours(wear_mask, [c], -1, 255, thickness=cv2.FILLED)
 
     wear_mask = cv2.bitwise_and(wear_mask, inner_mask)
+    wear_mask = cv2.morphologyEx(wear_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     return img_bgr, sole_mask, wear_mask
 
 def zone_score_from_mask(mask: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
@@ -684,7 +707,7 @@ def asymmetry_adjust_scores(left_scores: dict, right_scores: dict) -> tuple[dict
 
     return left_adj, right_adj
 
-def top_wear_zones(scores: dict, threshold: float = 0.16):
+def top_wear_zones(scores: dict, threshold: float = 0.15):
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [name for name, score in ranked if score >= threshold][:5]
 
@@ -693,12 +716,12 @@ def make_mask_overlay(img_bgr: np.ndarray, sole_mask: np.ndarray, wear_mask: np.
     overlay = np.zeros_like(base_rgba, dtype=np.uint8)
 
     overlay[..., 0] = 255
-    overlay[..., 1] = 95
-    overlay[..., 2] = 30
-    overlay[..., 3] = np.where(wear_mask > 0, 178, 0).astype(np.uint8)
+    overlay[..., 1] = 100
+    overlay[..., 2] = 35
+    overlay[..., 3] = np.where(wear_mask > 0, 180, 0).astype(np.uint8)
 
     alpha = overlay[..., 3]
-    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=3.0, sigmaY=3.0)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=4.0, sigmaY=4.0)
     overlay[..., 3] = alpha
 
     contours, _ = cv2.findContours(sole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -764,10 +787,6 @@ def infer_pronation_from_scores(left_scores: dict, right_scores: dict):
             "shoe_category": shoe_category,
             "confidence": overall_conf,
         },
-        "photo_quality": {
-            "ok": True,
-            "issues": []
-        }
     }
 
 @app.post("/analyze")
