@@ -434,7 +434,6 @@ form.addEventListener("submit", async (e) => {
 </html>
 """
 
-
 ZONE_RECTS = {
     "lateral_forefoot": (0.00, 0.00, 0.42, 0.34),
     "central_forefoot": (0.29, 0.14, 0.71, 0.42),
@@ -471,7 +470,7 @@ def head_root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "YOLO-WORLD-WEAR-V1"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "YOLO-WORLD-WEAR-V2"}
 
 
 def upload_to_bytes(upload: UploadFile) -> bytes:
@@ -575,16 +574,22 @@ def get_hand_boxes(detections: List[Dict]) -> List[List[float]]:
     return [d["xyxy"] for d in detections if d["label"] == "hand"]
 
 
-def expand_box(box: List[float], img_shape: Tuple[int, int, int], pad_x: float = 0.12, pad_y: float = 0.10) -> Tuple[int, int, int, int]:
+def expand_box(
+    box: List[float],
+    img_shape: Tuple[int, int, int],
+    pad_x: float = 0.08,
+    pad_y_top: float = 0.08,
+    pad_y_bottom: float = 0.03,
+) -> Tuple[int, int, int, int]:
     h, w = img_shape[:2]
     x1, y1, x2, y2 = box
     bw = x2 - x1
     bh = y2 - y1
 
     nx1 = max(0, int(round(x1 - bw * pad_x)))
-    ny1 = max(0, int(round(y1 - bh * pad_y)))
+    ny1 = max(0, int(round(y1 - bh * pad_y_top)))
     nx2 = min(w, int(round(x2 + bw * pad_x)))
-    ny2 = min(h, int(round(y2 + bh * pad_y)))
+    ny2 = min(h, int(round(y2 + bh * pad_y_bottom)))
     return nx1, ny1, nx2, ny2
 
 
@@ -600,7 +605,11 @@ def intersect_box(a: Tuple[int, int, int, int], b: List[float]) -> Optional[Tupl
     return x1, y1, x2, y2
 
 
-def build_hand_mask_for_crop(crop_shape: Tuple[int, int, int], crop_box: Tuple[int, int, int, int], hand_boxes: List[List[float]]) -> np.ndarray:
+def build_hand_mask_for_crop(
+    crop_shape: Tuple[int, int, int],
+    crop_box: Tuple[int, int, int, int],
+    hand_boxes: List[List[float]],
+) -> np.ndarray:
     h, w = crop_shape[:2]
     mask = np.zeros((h, w), np.uint8)
 
@@ -621,6 +630,75 @@ def build_hand_mask_for_crop(crop_shape: Tuple[int, int, int], crop_box: Tuple[i
     return mask
 
 
+def build_skin_mask(bgr: np.ndarray) -> np.ndarray:
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    skin1 = cv2.inRange(
+        ycrcb,
+        np.array([0, 133, 77], dtype=np.uint8),
+        np.array([255, 173, 127], dtype=np.uint8),
+    )
+    skin2 = cv2.inRange(
+        hsv,
+        np.array([0, 20, 40], dtype=np.uint8),
+        np.array([25, 255, 255], dtype=np.uint8),
+    )
+
+    skin = cv2.bitwise_and(skin1, skin2)
+    skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    return skin
+
+
+def remove_bottom_touching_components(mask: np.ndarray, bottom_fraction: float = 0.22) -> np.ndarray:
+    h, w = mask.shape[:2]
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    out = np.zeros_like(mask)
+    bottom_y = int(h * (1.0 - bottom_fraction))
+
+    for label in range(1, num_labels):
+        x, y, bw, bh, area = stats[label]
+        if area <= 0:
+            continue
+
+        component = (labels == label).astype(np.uint8) * 255
+        touches_bottom = (y + bh) >= (h - 2)
+        too_low = y >= bottom_y
+        touches_bottom_corner = (
+            (x < int(w * 0.12) and (y + bh) >= h - 2) or
+            ((x + bw) > int(w * 0.88) and (y + bh) >= h - 2)
+        )
+
+        if touches_bottom or too_low or touches_bottom_corner:
+            continue
+
+        out = cv2.bitwise_or(out, component)
+
+    return out
+
+
+def contour_touches_bottom(contour: np.ndarray, shape: Tuple[int, int, int]) -> bool:
+    h, _ = shape[:2]
+    ys = contour[:, 0, 1]
+    return int(np.max(ys)) >= h - 3
+
+
+def contour_bottom_corner_penalty(contour: np.ndarray, shape: Tuple[int, int, int]) -> float:
+    h, w = shape[:2]
+    pts = contour[:, 0, :]
+    penalty = 0.0
+
+    for x, y in pts:
+        if y > h * 0.90 and x < w * 0.18:
+            penalty += 1.0
+        if y > h * 0.90 and x > w * 0.82:
+            penalty += 1.0
+
+    return penalty
+
+
 def extract_sole_mask_from_crop(crop_bgr: np.ndarray, hand_mask: np.ndarray) -> np.ndarray:
     h, w = crop_bgr.shape[:2]
 
@@ -638,16 +716,25 @@ def extract_sole_mask_from_crop(crop_bgr: np.ndarray, hand_mask: np.ndarray) -> 
     base = cv2.bitwise_or(colour_mask, texture_mask)
     base = cv2.bitwise_and(base, visible_mask)
 
-    if np.count_nonzero(hand_mask) > 0:
-        base = cv2.bitwise_and(base, cv2.bitwise_not(hand_mask))
+    skin_mask = build_skin_mask(crop_bgr)
+    lower_band = np.zeros_like(skin_mask)
+    lower_band[int(h * 0.68):, :] = 255
+    skin_mask = cv2.bitwise_and(skin_mask, lower_band)
 
-    # GrabCut seeded inside crop
+    combined_hand = hand_mask.copy()
+    if np.count_nonzero(skin_mask) > 0:
+        combined_hand = cv2.bitwise_or(combined_hand, skin_mask)
+
+    if np.count_nonzero(combined_hand) > 0:
+        combined_hand = cv2.dilate(combined_hand, np.ones((19, 19), np.uint8), iterations=1)
+        base = cv2.bitwise_and(base, cv2.bitwise_not(combined_hand))
+
     gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
     rect = (
         max(1, int(w * 0.05)),
         max(1, int(h * 0.03)),
         max(2, int(w * 0.90)),
-        max(2, int(h * 0.92)),
+        max(2, int(h * 0.90)),
     )
     bgd_model = np.zeros((1, 65), np.float64)
     fgd_model = np.zeros((1, 65), np.float64)
@@ -657,7 +744,7 @@ def extract_sole_mask_from_crop(crop_bgr: np.ndarray, hand_mask: np.ndarray) -> 
         gc_bin = np.where(
             (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
             255,
-            0
+            0,
         ).astype(np.uint8)
     except Exception:
         gc_bin = np.zeros((h, w), np.uint8)
@@ -670,21 +757,44 @@ def extract_sole_mask_from_crop(crop_bgr: np.ndarray, hand_mask: np.ndarray) -> 
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
+    mask = remove_bottom_touching_components(mask, bottom_fraction=0.22)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         raise ValueError("Could not isolate the sole inside the YOLO crop.")
 
     best = None
     best_score = -1e9
+
     for c in contours:
         area = cv2.contourArea(c)
-        if area < h * w * 0.04:
+        if area < h * w * 0.03:
             continue
+
         x, y, bw, bh = cv2.boundingRect(c)
         aspect = bh / max(1, bw)
         cx = x + bw / 2.0
+        cy = y + bh / 2.0
         center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
-        score = area * max(0.1, center_score) * max(0.5, min(2.0, aspect))
+        vertical_score = 1.0 - abs(cy - (h * 0.42)) / (h * 0.42)
+
+        hull = cv2.convexHull(c)
+        hull_area = max(cv2.contourArea(hull), 1.0)
+        solidity = area / hull_area
+
+        penalty = 0.0
+        if contour_touches_bottom(c, crop_bgr.shape):
+            penalty += 3.0
+        penalty += contour_bottom_corner_penalty(c, crop_bgr.shape) * 0.2
+
+        score = 0.0
+        score += 2.4 * area / float(h * w)
+        score += 1.2 * max(0.0, min(1.0, center_score))
+        score += 0.8 * max(0.0, min(1.0, vertical_score))
+        score += 0.8 * min(2.0, aspect)
+        score += 0.8 * max(0.0, min(1.0, solidity))
+        score -= penalty
+
         if score > best_score:
             best_score = score
             best = c
@@ -697,6 +807,7 @@ def extract_sole_mask_from_crop(crop_bgr: np.ndarray, hand_mask: np.ndarray) -> 
 
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+    sole_mask[int(h * 0.985):, :] = 0
 
     return sole_mask
 
@@ -966,7 +1077,7 @@ def build_analysis_text(left_scores: Dict[str, float], right_scores: Dict[str, f
     left_medial = max(left_scores.get("medial_heel", 0), left_scores.get("medial_forefoot", 0))
     right_medial = max(right_scores.get("medial_heel", 0), right_scores.get("medial_forefoot", 0))
 
-    overall_bias = "balanced overall"
+    overall_bias = "a broadly balanced wear pattern overall"
     if (left_lateral + right_lateral) - (left_medial + right_medial) > 0.18:
         overall_bias = "a mild lateral loading bias overall"
     elif (left_medial + right_medial) - (left_lateral + right_lateral) > 0.18:
@@ -989,7 +1100,7 @@ def analyze_one_shoe(base_bytes: bytes) -> Tuple[np.ndarray, np.ndarray, np.ndar
     sole_box = choose_best_sole_box(detections, img_bgr.shape)
     hand_boxes = get_hand_boxes(detections)
 
-    crop_box = expand_box(sole_box, img_bgr.shape, pad_x=0.10, pad_y=0.08)
+    crop_box = expand_box(sole_box, img_bgr.shape, pad_x=0.08, pad_y_top=0.08, pad_y_bottom=0.03)
     x1, y1, x2, y2 = crop_box
     crop = img_bgr[y1:y2, x1:x2].copy()
 
