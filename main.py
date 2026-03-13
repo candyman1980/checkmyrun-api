@@ -4,7 +4,7 @@ cv2.setNumThreads(1)
 import base64
 import io
 from functools import lru_cache
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from rembg import remove, new_session
+from ultralytics import YOLOWorld
 
 
 app = FastAPI(title="CheckMyRun")
@@ -183,10 +183,11 @@ INDEX_HTML = """
     <div class="hint">
       Best results:
       <ul>
-        <li>one sole filling most of the frame</li>
-        <li>camera straight-on, not angled</li>
-        <li>plain background if possible</li>
-        <li>avoid hand, bag, chair, or floor clutter around the sole</li>
+        <li>one sole per frame</li>
+        <li>fill most of the frame with the sole</li>
+        <li>camera as straight-on as possible</li>
+        <li>keep fingers low on the heel edge if you have to hold the shoe</li>
+        <li>plain background helps, but the detector now tries to ignore hands</li>
       </ul>
     </div>
 
@@ -273,10 +274,6 @@ INDEX_HTML = """
         <summary>Raw JSON</summary>
         <pre id="json"></pre>
       </details>
-
-      <footer style="margin-top:14px;font-size:13px;color:#666">
-        Informational only — not medical advice.
-      </footer>
     </div>
   </div>
 
@@ -334,14 +331,11 @@ function showPreview(input, imgEl, placeholderEl, metaEl) {
 
 function safeSetOverlay(container, dataUrl, altText) {
   container.innerHTML = "";
-
   if (!dataUrl || typeof dataUrl !== "string") {
     container.innerHTML = '<span class="muted">No overlay returned.</span>';
     return;
   }
-
   const trimmed = dataUrl.trim();
-
   if (
     !trimmed.startsWith("data:image/png;base64,") &&
     !trimmed.startsWith("data:image/jpeg;base64,") &&
@@ -350,7 +344,6 @@ function safeSetOverlay(container, dataUrl, altText) {
     container.innerHTML = '<span class="muted">Overlay returned in unexpected format.</span>';
     return;
   }
-
   try {
     const img = document.createElement("img");
     img.alt = altText;
@@ -380,10 +373,7 @@ form.addEventListener("submit", async (e) => {
 
   try {
     const fd = new FormData(form);
-    const res = await fetch(API, {
-      method: "POST",
-      body: fd
-    });
+    const res = await fetch(API, { method: "POST", body: fd });
 
     const rawText = await res.text();
     jsonOut.textContent = rawText;
@@ -392,7 +382,7 @@ form.addEventListener("submit", async (e) => {
     let data;
     try {
       data = JSON.parse(rawText);
-    } catch (parseErr) {
+    } catch {
       throw new Error("Server did not return valid JSON. Check Raw JSON below.");
     }
 
@@ -401,6 +391,7 @@ form.addEventListener("submit", async (e) => {
     }
 
     summary.innerHTML = `
+      <p><strong>Overall:</strong> ${data.analysis_text || "Analysis complete."}</p>
       <p><strong>Overall pronation:</strong> ${prettyLabel(data.overall?.pronation)}</p>
       <p><strong>Shoe category:</strong> ${prettyLabel(data.overall?.shoe_category)}</p>
       <p><strong>Confidence:</strong> ${Math.round((data.overall?.confidence || 0) * 100)}%</p>
@@ -443,6 +434,7 @@ form.addEventListener("submit", async (e) => {
 </html>
 """
 
+
 ZONE_RECTS = {
     "lateral_forefoot": (0.00, 0.00, 0.42, 0.34),
     "central_forefoot": (0.29, 0.14, 0.71, 0.42),
@@ -456,8 +448,15 @@ ZONE_RECTS = {
 
 
 @lru_cache(maxsize=1)
-def get_rembg_session():
-    return new_session("u2netp")
+def get_yolo_world():
+    model = YOLOWorld("yolov8s-world.pt")
+    model.set_classes([
+        "shoe sole",
+        "outsole",
+        "running shoe sole",
+        "hand",
+    ])
+    return model
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -472,7 +471,7 @@ def head_root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "checkmyrun-api", "marker": "SEGMENT-WEAR-V4"}
+    return {"ok": True, "service": "checkmyrun-api", "marker": "YOLO-WORLD-WEAR-V1"}
 
 
 def upload_to_bytes(upload: UploadFile) -> bytes:
@@ -489,7 +488,7 @@ def img_to_data_url_pil(img: Image.Image) -> str:
     return f"data:image/png;base64,{b64}"
 
 
-def resize_for_processing(img_bgr: np.ndarray, max_size: int = 1200) -> np.ndarray:
+def resize_for_processing(img_bgr: np.ndarray, max_size: int = 1280) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     scale = max_size / max(h, w)
     if scale < 1:
@@ -501,147 +500,208 @@ def resize_for_processing(img_bgr: np.ndarray, max_size: int = 1200) -> np.ndarr
     return img_bgr
 
 
-def run_rembg_alpha(base_bytes: bytes) -> np.ndarray:
-    session = get_rembg_session()
-    out_bytes = remove(base_bytes, session=session)
-    rgba = Image.open(io.BytesIO(out_bytes)).convert("RGBA")
-    alpha = np.array(rgba)[..., 3]
-    return alpha
-
-
-def contour_shape_score(contour, img_shape) -> float:
-    h, w = img_shape[:2]
-    area = cv2.contourArea(contour)
-    if area <= 0:
-        return -1e9
-
-    x, y, cw, ch = cv2.boundingRect(contour)
-    cx = x + cw / 2.0
-    cy = y + ch / 2.0
-
-    aspect = ch / max(cw, 1)
-    hull = cv2.convexHull(contour)
-    hull_area = max(cv2.contourArea(hull), 1.0)
-    solidity = area / hull_area
-    perimeter = max(cv2.arcLength(contour, True), 1.0)
-    compactness = 4.0 * np.pi * area / (perimeter * perimeter)
-
-    center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
-    vertical_score = 1.0 - abs(cy - (h * 0.46)) / (h * 0.46)
-
-    if aspect < 1.05:
-        return -1e9
-    if area < h * w * 0.035:
-        return -1e9
-
-    score = 0.0
-    score += 2.5 * (area / (h * w))
-    score += 1.8 * max(0.0, min(1.0, center_score))
-    score += 1.2 * max(0.0, min(1.0, vertical_score))
-    score += 0.9 * min(2.5, aspect)
-    score += 0.9 * max(0.0, solidity)
-    score += 0.4 * max(0.0, compactness)
-    return score
-
-
-def evaluate_mask_quality(mask: np.ndarray, img_shape: Tuple[int, int, int]) -> Tuple[float, Dict[str, float]]:
-    h, w = img_shape[:2]
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return 0.0, {"area_ratio": 0.0, "aspect": 0.0, "center_score": 0.0, "solidity": 0.0}
-
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
-    bw = max(1, x1 - x0)
-    bh = max(1, y1 - y0)
-
-    area_ratio = float(np.count_nonzero(mask)) / float(h * w)
-    aspect = bh / bw
-    cx = (x0 + x1) / 2.0
-    center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    solidity = 0.0
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        hull = cv2.convexHull(c)
-        hull_area = max(cv2.contourArea(hull), 1.0)
-        solidity = cv2.contourArea(c) / hull_area
-
-    quality = 0.0
-    quality += 0.35 * min(1.0, area_ratio / 0.18)
-    quality += 0.25 * min(1.0, aspect / 2.0)
-    quality += 0.20 * max(0.0, min(1.0, center_score))
-    quality += 0.20 * max(0.0, min(1.0, solidity))
-
-    return quality, {
-        "area_ratio": float(area_ratio),
-        "aspect": float(aspect),
-        "center_score": float(center_score),
-        "solidity": float(solidity),
-    }
-
-
-def extract_sole_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+def decode_image(base_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(base_bytes, np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise ValueError("Could not decode image")
+    return resize_for_processing(img_bgr, max_size=1280)
 
-    img_bgr = resize_for_processing(img_bgr, max_size=1200)
-    h, w = img_bgr.shape[:2]
 
-    ok, enc = cv2.imencode(".png", img_bgr)
-    if not ok:
-        raise ValueError("Could not encode image for segmentation")
+def detect_world_boxes(img_bgr: np.ndarray) -> List[Dict]:
+    model = get_yolo_world()
+    results = model.predict(img_bgr, imgsz=640, conf=0.12, verbose=False)
+    r = results[0]
 
-    alpha = run_rembg_alpha(enc.tobytes())
-    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=2.2, sigmaY=2.2)
-    seg_mask = cv2.inRange(alpha, 22, 255)
+    names = r.names
+    out: List[Dict] = []
 
-    corridor = np.zeros_like(seg_mask)
-    x0 = int(w * 0.15)
-    x1 = int(w * 0.85)
-    y0 = int(h * 0.01)
-    y1 = int(h * 0.94)
-    corridor[y0:y1, x0:x1] = 255
-    seg_mask = cv2.bitwise_and(seg_mask, corridor)
+    if r.boxes is None:
+        return out
 
-    seg_mask[int(h * 0.97):, :] = 0
+    boxes = r.boxes.xyxy.cpu().numpy()
+    confs = r.boxes.conf.cpu().numpy()
+    clss = r.boxes.cls.cpu().numpy().astype(int)
+
+    for box, conf, cls_id in zip(boxes, confs, clss):
+        out.append({
+            "xyxy": [float(v) for v in box.tolist()],
+            "conf": float(conf),
+            "label": str(names[int(cls_id)]).lower(),
+        })
+    return out
+
+
+def score_sole_candidate(box: List[float], conf: float, img_shape: Tuple[int, int, int]) -> float:
+    h, w = img_shape[:2]
+    x1, y1, x2, y2 = box
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
+    area_ratio = (bw * bh) / float(h * w)
+    aspect = bh / bw
+    center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
+    vertical_score = 1.0 - abs(cy - (h * 0.46)) / (h * 0.46)
+
+    if aspect < 0.9:
+        return -1e9
+    if area_ratio < 0.04:
+        return -1e9
+
+    score = 0.0
+    score += 1.6 * conf
+    score += 2.0 * min(1.0, area_ratio / 0.25)
+    score += 1.0 * max(0.0, min(1.0, center_score))
+    score += 0.6 * max(0.0, min(1.0, vertical_score))
+    score += 0.5 * min(2.0, aspect)
+    return score
+
+
+def choose_best_sole_box(detections: List[Dict], img_shape: Tuple[int, int, int]) -> List[float]:
+    sole_like = [d for d in detections if d["label"] in {"shoe sole", "outsole", "running shoe sole"}]
+    if not sole_like:
+        raise ValueError("YOLO could not find the shoe sole. Retake the photo with the sole larger in frame.")
+
+    best = max(
+        sole_like,
+        key=lambda d: score_sole_candidate(d["xyxy"], d["conf"], img_shape),
+    )
+    return best["xyxy"]
+
+
+def get_hand_boxes(detections: List[Dict]) -> List[List[float]]:
+    return [d["xyxy"] for d in detections if d["label"] == "hand"]
+
+
+def expand_box(box: List[float], img_shape: Tuple[int, int, int], pad_x: float = 0.12, pad_y: float = 0.10) -> Tuple[int, int, int, int]:
+    h, w = img_shape[:2]
+    x1, y1, x2, y2 = box
+    bw = x2 - x1
+    bh = y2 - y1
+
+    nx1 = max(0, int(round(x1 - bw * pad_x)))
+    ny1 = max(0, int(round(y1 - bh * pad_y)))
+    nx2 = min(w, int(round(x2 + bw * pad_x)))
+    ny2 = min(h, int(round(y2 + bh * pad_y)))
+    return nx1, ny1, nx2, ny2
+
+
+def intersect_box(a: Tuple[int, int, int, int], b: List[float]) -> Optional[Tuple[int, int, int, int]]:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = [int(round(v)) for v in b]
+    x1 = max(ax1, bx1)
+    y1 = max(ay1, by1)
+    x2 = min(ax2, bx2)
+    y2 = min(ay2, by2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def build_hand_mask_for_crop(crop_shape: Tuple[int, int, int], crop_box: Tuple[int, int, int, int], hand_boxes: List[List[float]]) -> np.ndarray:
+    h, w = crop_shape[:2]
+    mask = np.zeros((h, w), np.uint8)
+
+    for hb in hand_boxes:
+        inter = intersect_box(crop_box, hb)
+        if inter is None:
+            continue
+        ix1, iy1, ix2, iy2 = inter
+        rx1 = ix1 - crop_box[0]
+        ry1 = iy1 - crop_box[1]
+        rx2 = ix2 - crop_box[0]
+        ry2 = iy2 - crop_box[1]
+        cv2.rectangle(mask, (rx1, ry1), (rx2, ry2), 255, thickness=-1)
+
+    if np.count_nonzero(mask) > 0:
+        mask = cv2.dilate(mask, np.ones((15, 15), np.uint8), iterations=1)
+
+    return mask
+
+
+def extract_sole_mask_from_crop(crop_bgr: np.ndarray, hand_mask: np.ndarray) -> np.ndarray:
+    h, w = crop_bgr.shape[:2]
+
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    _, s_chan, v_chan = cv2.split(hsv)
+
+    texture = cv2.Canny(gray, 35, 125)
+    texture = cv2.blur(texture, (11, 11))
+    texture_mask = cv2.inRange(texture, 6, 255)
+
+    colour_mask = cv2.inRange(s_chan, 20, 255)
+    visible_mask = cv2.inRange(v_chan, 30, 255)
+
+    base = cv2.bitwise_or(colour_mask, texture_mask)
+    base = cv2.bitwise_and(base, visible_mask)
+
+    if np.count_nonzero(hand_mask) > 0:
+        base = cv2.bitwise_and(base, cv2.bitwise_not(hand_mask))
+
+    # GrabCut seeded inside crop
+    gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+    rect = (
+        max(1, int(w * 0.05)),
+        max(1, int(h * 0.03)),
+        max(2, int(w * 0.90)),
+        max(2, int(h * 0.92)),
+    )
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(crop_bgr, gc_mask, rect, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_RECT)
+        gc_bin = np.where(
+            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
+            255,
+            0
+        ).astype(np.uint8)
+    except Exception:
+        gc_bin = np.zeros((h, w), np.uint8)
+        x, y, rw, rh = rect
+        gc_bin[y:y+rh, x:x+rw] = 255
+
+    mask = cv2.bitwise_and(base, gc_bin)
 
     kernel = np.ones((9, 9), np.uint8)
-    seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_CLOSE, kernel)
-    seg_mask = cv2.morphologyEx(seg_mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    contours, _ = cv2.findContours(seg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    sole_mask = np.zeros_like(seg_mask)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("Could not isolate the sole inside the YOLO crop.")
 
-    if contours:
-        scored = sorted(contours, key=lambda c: contour_shape_score(c, img_bgr.shape), reverse=True)
-        best = scored[0]
-        if contour_shape_score(best, img_bgr.shape) > -1e8:
-            cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
+    best = None
+    best_score = -1e9
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < h * w * 0.04:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        aspect = bh / max(1, bw)
+        cx = x + bw / 2.0
+        center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
+        score = area * max(0.1, center_score) * max(0.5, min(2.0, aspect))
+        if score > best_score:
+            best_score = score
+            best = c
 
-    if cv2.countNonZero(sole_mask) == 0:
-        raise ValueError("Could not isolate the sole. Try a straighter photo with less background visible.")
+    if best is None:
+        best = max(contours, key=cv2.contourArea)
+
+    sole_mask = np.zeros_like(mask)
+    cv2.drawContours(sole_mask, [best], -1, 255, thickness=cv2.FILLED)
 
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
     sole_mask = cv2.morphologyEx(sole_mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
-    sole_mask = cv2.dilate(sole_mask, np.ones((5, 5), np.uint8), iterations=1)
-    sole_mask[int(h * 0.975):, :] = 0
 
-    quality, debug = evaluate_mask_quality(sole_mask, img_bgr.shape)
-    debug["quality"] = float(quality)
-
-    if quality < 0.43:
-        raise ValueError(
-            "Could not isolate the sole cleanly enough. Retake the photo straighter, closer, and with less hand/background visible."
-        )
-
-    return img_bgr, sole_mask, debug
+    return sole_mask
 
 
-def estimate_fresh_rubber_reference(img_bgr: np.ndarray, sole_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def estimate_fresh_rubber_reference(img_bgr: np.ndarray, sole_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     _, s_chan, v_chan = cv2.split(hsv)
 
@@ -660,21 +720,20 @@ def estimate_fresh_rubber_reference(img_bgr: np.ndarray, sole_mask: np.ndarray) 
     return hsv, fresh_mask
 
 
-def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
-    img_bgr, sole_mask, mask_debug = extract_sole_mask(base_bytes)
-
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+def compute_wear_mask(crop_bgr: np.ndarray, sole_mask: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     gray_eq = cv2.equalizeHist(gray)
-    hsv, fresh_mask = estimate_fresh_rubber_reference(img_bgr, sole_mask)
+
+    hsv, fresh_mask = estimate_fresh_rubber_reference(crop_bgr, sole_mask)
     _, s_chan, v_chan = cv2.split(hsv)
 
     if cv2.countNonZero(fresh_mask) > 80:
-        fresh_mean_bgr = cv2.mean(img_bgr, mask=fresh_mask)[:3]
+        fresh_mean_bgr = cv2.mean(crop_bgr, mask=fresh_mask)[:3]
         fresh_mean_gray = cv2.mean(gray_eq, mask=fresh_mask)[0]
         fresh_mean_sat = cv2.mean(s_chan, mask=fresh_mask)[0]
 
         ref = np.array(fresh_mean_bgr, dtype=np.float32).reshape(1, 1, 3)
-        colour_diff = np.sqrt(np.sum((img_bgr.astype(np.float32) - ref) ** 2, axis=2))
+        colour_diff = np.sqrt(np.sum((crop_bgr.astype(np.float32) - ref) ** 2, axis=2))
         colour_diff = cv2.normalize(colour_diff, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
         sat_delta = np.clip((fresh_mean_sat - s_chan).astype(np.float32), 0, 255).astype(np.uint8)
@@ -719,7 +778,7 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
 
     contours, _ = cv2.findContours(wear_candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     wear_mask = np.zeros_like(wear_candidate)
-    min_area = max(40, int(img_bgr.shape[0] * img_bgr.shape[1] * 0.00020))
+    min_area = max(40, int(crop_bgr.shape[0] * crop_bgr.shape[1] * 0.00020))
 
     for c in contours:
         if cv2.contourArea(c) >= min_area:
@@ -727,8 +786,7 @@ def compute_wear_mask(base_bytes: bytes) -> tuple[np.ndarray, np.ndarray, np.nda
 
     wear_mask = cv2.bitwise_and(wear_mask, inner_mask)
     wear_mask = cv2.morphologyEx(wear_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-
-    return img_bgr, sole_mask, wear_mask, mask_debug
+    return wear_mask
 
 
 def zone_score_from_mask(mask: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
@@ -738,7 +796,7 @@ def zone_score_from_mask(mask: np.ndarray, x0: int, y0: int, x1: int, y1: int) -
     return float(np.count_nonzero(roi)) / float(roi.size)
 
 
-def compute_zone_wear_scores_from_masks(sole_mask: np.ndarray, wear_mask: np.ndarray) -> dict:
+def compute_zone_wear_scores_from_masks(sole_mask: np.ndarray, wear_mask: np.ndarray) -> Dict[str, float]:
     ys, xs = np.where(sole_mask > 0)
     if len(xs) == 0 or len(ys) == 0:
         raise ValueError("Could not isolate sole")
@@ -764,11 +822,10 @@ def compute_zone_wear_scores_from_masks(sole_mask: np.ndarray, wear_mask: np.nda
             norm_scores[k] = 0.0
         else:
             norm_scores[k] = max(0.0, min(1.0, (v - vmin) / (vmax - vmin)))
-
     return norm_scores
 
 
-def mirror_right_scores_to_left_frame(right_scores: dict) -> dict:
+def mirror_right_scores_to_left_frame(right_scores: Dict[str, float]) -> Dict[str, float]:
     mapping = {
         "lateral_forefoot": "medial_forefoot",
         "central_forefoot": "central_forefoot",
@@ -782,7 +839,7 @@ def mirror_right_scores_to_left_frame(right_scores: dict) -> dict:
     return {mapping[k]: v for k, v in right_scores.items()}
 
 
-def asymmetry_adjust_scores(left_scores: dict, right_scores: dict) -> tuple[dict, dict]:
+def asymmetry_adjust_scores(left_scores: Dict[str, float], right_scores: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, float]]:
     mirrored_right = mirror_right_scores_to_left_frame(right_scores)
 
     left_adj = left_scores.copy()
@@ -813,7 +870,7 @@ def asymmetry_adjust_scores(left_scores: dict, right_scores: dict) -> tuple[dict
     return left_adj, right_adj
 
 
-def top_wear_zones(scores: dict, threshold: float = 0.15):
+def top_wear_zones(scores: Dict[str, float], threshold: float = 0.15) -> List[str]:
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [name for name, score in ranked if score >= threshold][:5]
 
@@ -840,8 +897,8 @@ def make_mask_overlay(img_bgr: np.ndarray, sole_mask: np.ndarray, wear_mask: np.
     return img_to_data_url_pil(combined)
 
 
-def infer_pronation_from_scores(left_scores: dict, right_scores: dict):
-    def side_result(scores: dict):
+def infer_pronation_from_scores(left_scores: Dict[str, float], right_scores: Dict[str, float]) -> Dict:
+    def side_result(scores: Dict[str, float]) -> Tuple[str, float, str]:
         medial = max(scores.get("medial_forefoot", 0), scores.get("medial_heel", 0), scores.get("medial_midfoot", 0))
         lateral = max(scores.get("lateral_forefoot", 0), scores.get("lateral_heel", 0), scores.get("lateral_midfoot", 0))
         center = max(scores.get("central_forefoot", 0), scores.get("central_heel", 0))
@@ -897,6 +954,59 @@ def infer_pronation_from_scores(left_scores: dict, right_scores: dict):
     }
 
 
+def build_analysis_text(left_scores: Dict[str, float], right_scores: Dict[str, float]) -> str:
+    left_top = top_wear_zones(left_scores, threshold=0.12)
+    right_top = top_wear_zones(right_scores, threshold=0.12)
+
+    left_desc = ", ".join(z.replace("_", " ") for z in left_top[:2]) or "no strong left-side pattern"
+    right_desc = ", ".join(z.replace("_", " ") for z in right_top[:2]) or "no strong right-side pattern"
+
+    left_lateral = max(left_scores.get("lateral_heel", 0), left_scores.get("lateral_forefoot", 0))
+    right_lateral = max(right_scores.get("lateral_heel", 0), right_scores.get("lateral_forefoot", 0))
+    left_medial = max(left_scores.get("medial_heel", 0), left_scores.get("medial_forefoot", 0))
+    right_medial = max(right_scores.get("medial_heel", 0), right_scores.get("medial_forefoot", 0))
+
+    overall_bias = "balanced overall"
+    if (left_lateral + right_lateral) - (left_medial + right_medial) > 0.18:
+        overall_bias = "a mild lateral loading bias overall"
+    elif (left_medial + right_medial) - (left_lateral + right_lateral) > 0.18:
+        overall_bias = "a mild medial loading bias overall"
+
+    asym = abs(sum(left_scores.values()) - sum(right_scores.values()))
+    asym_text = "left and right look fairly similar"
+    if asym > 0.35:
+        asym_text = "left and right do not look very symmetrical"
+
+    return (
+        f"Main wear looks strongest in the left shoe around {left_desc}, and in the right shoe around {right_desc}. "
+        f"That suggests {overall_bias}, and {asym_text}."
+    )
+
+
+def analyze_one_shoe(base_bytes: bytes) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, float], Dict]:
+    img_bgr = decode_image(base_bytes)
+    detections = detect_world_boxes(img_bgr)
+    sole_box = choose_best_sole_box(detections, img_bgr.shape)
+    hand_boxes = get_hand_boxes(detections)
+
+    crop_box = expand_box(sole_box, img_bgr.shape, pad_x=0.10, pad_y=0.08)
+    x1, y1, x2, y2 = crop_box
+    crop = img_bgr[y1:y2, x1:x2].copy()
+
+    hand_mask = build_hand_mask_for_crop(crop.shape, crop_box, hand_boxes)
+    sole_mask = extract_sole_mask_from_crop(crop, hand_mask)
+    wear_mask = compute_wear_mask(crop, sole_mask)
+    scores = compute_zone_wear_scores_from_masks(sole_mask, wear_mask)
+
+    debug = {
+        "detections": detections,
+        "sole_box": sole_box,
+        "crop_box": crop_box,
+        "hand_overlap_pixels": int(np.count_nonzero(hand_mask)),
+    }
+    return crop, sole_mask, wear_mask, scores, debug
+
+
 @app.post("/analyze")
 @app.post("/analyse")
 @app.post("/api/analyze")
@@ -910,16 +1020,13 @@ async def analyze(
         left_bytes = upload_to_bytes(left)
         right_bytes = upload_to_bytes(right)
 
-        left_img, left_sole_mask, left_wear_mask, left_mask_debug = compute_wear_mask(left_bytes)
-        right_img, right_sole_mask, right_wear_mask, right_mask_debug = compute_wear_mask(right_bytes)
-
-        left_scores = compute_zone_wear_scores_from_masks(left_sole_mask, left_wear_mask)
-        right_scores = compute_zone_wear_scores_from_masks(right_sole_mask, right_wear_mask)
+        left_crop, left_sole_mask, left_wear_mask, left_scores, left_debug = analyze_one_shoe(left_bytes)
+        right_crop, right_sole_mask, right_wear_mask, right_scores, right_debug = analyze_one_shoe(right_bytes)
 
         left_scores, right_scores = asymmetry_adjust_scores(left_scores, right_scores)
 
-        left_overlay = make_mask_overlay(left_img, left_sole_mask, left_wear_mask)
-        right_overlay = make_mask_overlay(right_img, right_sole_mask, right_wear_mask)
+        left_overlay = make_mask_overlay(left_crop, left_sole_mask, left_wear_mask)
+        right_overlay = make_mask_overlay(right_crop, right_sole_mask, right_wear_mask)
 
         data = infer_pronation_from_scores(left_scores, right_scores)
         data["left"]["wear_zones"] = top_wear_zones(left_scores)
@@ -928,9 +1035,10 @@ async def analyze(
         data["right_zone_scores"] = right_scores
         data["left_heatmap_data_url"] = left_overlay
         data["right_heatmap_data_url"] = right_overlay
+        data["analysis_text"] = build_analysis_text(left_scores, right_scores)
         data["debug"] = {
-            "left_mask": left_mask_debug,
-            "right_mask": right_mask_debug,
+            "left": left_debug,
+            "right": right_debug,
             "rear_supplied": rear is not None,
         }
 
