@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -340,16 +340,16 @@ INDEX_HTML = r"""
         </div>
       </div>
 
-      <h2 class="sectionTitle">Wear overlays</h2>
+      <h2 class="sectionTitle">Heatmaps</h2>
       <div class="heatmap-grid">
         <div class="heatmap-card">
-          <h3>Left overlay</h3>
-          <div id="leftHeatmapWrap" class="muted">No overlay returned yet.</div>
+          <h3>Left heatmap</h3>
+          <div id="leftHeatmapWrap" class="muted">No heatmap returned yet.</div>
         </div>
 
         <div class="heatmap-card">
-          <h3>Right overlay</h3>
-          <div id="rightHeatmapWrap" class="muted">No overlay returned yet.</div>
+          <h3>Right heatmap</h3>
+          <div id="rightHeatmapWrap" class="muted">No heatmap returned yet.</div>
         </div>
       </div>
 
@@ -418,15 +418,15 @@ function showPreview(input, imgEl, placeholderEl, metaEl, guideEl) {
   metaEl.textContent = file.name;
 }
 
-function safeSetOverlay(container, dataUrl, altText) {
+function safeSetImage(container, dataUrl, altText) {
   container.innerHTML = "";
   if (!dataUrl || typeof dataUrl !== "string") {
-    container.innerHTML = '<span class="muted">No overlay returned.</span>';
+    container.innerHTML = '<span class="muted">No image returned.</span>';
     return;
   }
   const trimmed = dataUrl.trim();
   if (!trimmed.startsWith("data:image/")) {
-    container.innerHTML = '<span class="muted">Overlay returned in unexpected format.</span>';
+    container.innerHTML = '<span class="muted">Image returned in unexpected format.</span>';
     return;
   }
   try {
@@ -435,7 +435,7 @@ function safeSetOverlay(container, dataUrl, altText) {
     img.src = trimmed;
     container.appendChild(img);
   } catch (e) {
-    container.innerHTML = '<span class="muted">Could not display overlay.</span>';
+    container.innerHTML = '<span class="muted">Could not display image.</span>';
   }
 }
 
@@ -452,8 +452,8 @@ form.addEventListener("submit", async (e) => {
   leftResult.innerHTML = "";
   rightResult.innerHTML = "";
   overallResult.innerHTML = "";
-  leftHeatmapWrap.innerHTML = '<span class="muted">No overlay returned yet.</span>';
-  rightHeatmapWrap.innerHTML = '<span class="muted">No overlay returned yet.</span>';
+  leftHeatmapWrap.innerHTML = '<span class="muted">No heatmap returned yet.</span>';
+  rightHeatmapWrap.innerHTML = '<span class="muted">No heatmap returned yet.</span>';
   jsonOut.textContent = "";
 
   try {
@@ -502,8 +502,8 @@ form.addEventListener("submit", async (e) => {
       <p><strong>Confidence:</strong> ${Math.round((data.overall?.confidence || 0) * 100)}%</p>
     `;
 
-    safeSetOverlay(leftHeatmapWrap, data.left_overlay_data_url, "Left overlay");
-    safeSetOverlay(rightHeatmapWrap, data.right_overlay_data_url, "Right overlay");
+    safeSetImage(leftHeatmapWrap, data.left_heatmap_data_url, "Left heatmap");
+    safeSetImage(rightHeatmapWrap, data.right_heatmap_data_url, "Right heatmap");
 
     status.textContent = "Done ✅";
   } catch (err) {
@@ -569,64 +569,9 @@ VISION_SCHEMA: Dict[str, Any] = {
                     "confidence": {"type": "number"}
                 },
                 "required": ["pronation", "shoe_category", "confidence"]
-            },
-            "left_outline": {
-                "type": ["array", "null"],
-                "items": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2
-                }
-            },
-            "right_outline": {
-                "type": ["array", "null"],
-                "items": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2
-                }
-            },
-            "left_heat_points": {
-                "type": ["array", "null"],
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "x": {"type": "number"},
-                        "y": {"type": "number"},
-                        "intensity": {"type": "number"},
-                        "radius": {"type": "number"}
-                    },
-                    "required": ["x", "y", "intensity", "radius"]
-                }
-            },
-            "right_heat_points": {
-                "type": ["array", "null"],
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "x": {"type": "number"},
-                        "y": {"type": "number"},
-                        "intensity": {"type": "number"},
-                        "radius": {"type": "number"}
-                    },
-                    "required": ["x", "y", "intensity", "radius"]
-                }
             }
         },
-        "required": [
-            "analysis_text",
-            "left",
-            "right",
-            "overall",
-            "left_outline",
-            "right_outline",
-            "left_heat_points",
-            "right_heat_points"
-        ]
+        "required": ["analysis_text", "left", "right", "overall"]
     }
 }
 
@@ -639,24 +584,19 @@ You must identify only the outsole itself and ignore hands, wrists, sleeves, wat
 Return JSON only.
 
 Rules:
-- Be object-aware. A human hand holding the heel is NOT part of the sole outline.
-- The outline must trace the visible outsole boundary only.
-- Outline points are normalized coordinates from 0 to 1 relative to the cropped image.
-- Heat points must sit only on meaningful visible wear regions of the outsole.
-- Do not spread heat across the whole sole.
-- If evidence is weak, lower confidence and say so.
+- Be object-aware.
 - Prefer useful insight over blandness.
-- Notes should mention left/right asymmetry where relevant.
-
-wear_zones examples:
-- lateral heel
-- central heel
-- medial heel
-- lateral forefoot
-- central forefoot
-- medial forefoot
-- lateral midfoot
-- medial midfoot
+- Lower confidence if the evidence is weak.
+- Notes should mention asymmetry where relevant.
+- wear_zones should use labels from this set when possible:
+  lateral heel
+  central heel
+  medial heel
+  lateral forefoot
+  central forefoot
+  medial forefoot
+  lateral midfoot
+  medial midfoot
 """
 
 USER_PROMPT = """
@@ -665,19 +605,42 @@ Analyse the attached cropped sole photos.
 Return:
 1. left/right/overall pronation judgement
 2. a useful written analysis
-3. normalized outsole outline for left and right
-4. wear heat points for left and right
-
-For the outline:
-- use about 18 to 40 points if possible
-- trace only the outsole edge
-- do NOT include hand or wrist
-
-For heat points:
-- use around 8 to 25 points per sole
-- each point must have x, y, intensity (0 to 1), radius (0.02 to 0.12)
-- place points over genuine wear regions, not decorative tread unless clearly worn
+3. concise notes for each shoe
+4. ordered wear_zones for each shoe from strongest to weaker
 """
+
+ZONE_MAP: Dict[str, List[Tuple[float, float, float, float, float]]] = {
+    "lateral heel": [
+        (0.22, 0.84, 0.15, 1.00, 1.00),
+        (0.28, 0.77, 0.11, 0.65, 0.70),
+    ],
+    "central heel": [
+        (0.50, 0.86, 0.16, 0.92, 1.00),
+        (0.50, 0.76, 0.10, 0.55, 0.75),
+    ],
+    "medial heel": [
+        (0.78, 0.84, 0.15, 1.00, 1.00),
+        (0.72, 0.77, 0.11, 0.65, 0.70),
+    ],
+    "lateral midfoot": [
+        (0.25, 0.57, 0.12, 0.82, 0.90),
+    ],
+    "medial midfoot": [
+        (0.75, 0.57, 0.12, 0.82, 0.90),
+    ],
+    "lateral forefoot": [
+        (0.24, 0.23, 0.14, 0.92, 1.00),
+        (0.18, 0.33, 0.10, 0.62, 0.72),
+    ],
+    "central forefoot": [
+        (0.50, 0.24, 0.13, 0.92, 1.00),
+        (0.50, 0.36, 0.11, 0.65, 0.75),
+    ],
+    "medial forefoot": [
+        (0.76, 0.23, 0.14, 0.92, 1.00),
+        (0.82, 0.33, 0.10, 0.62, 0.72),
+    ],
+}
 
 
 @lru_cache(maxsize=1)
@@ -701,14 +664,6 @@ def _file_to_data_url(file_bytes: bytes, filename: str) -> str:
         mime = "image/jpeg"
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
-
-
-def _clamp01(x: Any) -> float:
-    try:
-        x = float(x)
-        return max(0.0, min(1.0, x))
-    except Exception:
-        return 0.0
 
 
 def decode_image(base_bytes: bytes) -> np.ndarray:
@@ -851,7 +806,7 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
                 "strict": True,
             }
         },
-        "max_output_tokens": 1800,
+        "max_output_tokens": 1400,
     }
 
     with httpx.Client(timeout=120.0) as client:
@@ -870,65 +825,79 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
     return _extract_json_from_response(r.json())
 
 
-def normalize_outline(points: Optional[List[List[float]]]) -> Optional[List[List[float]]]:
-    if not points or not isinstance(points, list):
-        return None
-    out: List[List[float]] = []
-    for p in points:
-        if not isinstance(p, (list, tuple)) or len(p) < 2:
-            continue
-        out.append([_clamp01(p[0]), _clamp01(p[1])])
-    return out if len(out) >= 3 else None
+def normalise_zone_name(zone: str) -> str:
+    z = str(zone or "").strip().lower()
+    return z.replace("_", " ").replace("-", " ")
 
 
-def normalize_heat_points(points: Optional[List[Dict[str, Any]]]) -> List[Dict[str, float]]:
-    if not points or not isinstance(points, list):
-        return []
-    out: List[Dict[str, float]] = []
-    for p in points:
-        if not isinstance(p, dict):
-            continue
-        out.append({
-            "x": _clamp01(p.get("x", 0.0)),
-            "y": _clamp01(p.get("y", 0.0)),
-            "intensity": _clamp01(p.get("intensity", 0.4)),
-            "radius": max(0.02, min(0.12, float(p.get("radius", 0.05)))),
-        })
-    return out
+def zone_weights(zones: List[str]) -> List[Tuple[str, float]]:
+    cleaned = []
+    seen = set()
+    for z in zones:
+        nz = normalise_zone_name(z)
+        if nz in ZONE_MAP and nz not in seen:
+            cleaned.append(nz)
+            seen.add(nz)
+
+    weights = []
+    total = len(cleaned)
+    for i, z in enumerate(cleaned):
+        weight = max(0.45, 1.0 - i * 0.16)
+        weights.append((z, weight))
+    return weights
 
 
-def make_overlay_png(base_img_bytes: bytes, outline_points: Optional[List[List[float]]], heat_points: List[Dict[str, float]]) -> str:
+def make_zone_heatmap(base_img_bytes: bytes, zones: List[str]) -> str:
     base = Image.open(io.BytesIO(base_img_bytes)).convert("RGBA")
     w, h = base.size
 
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    heat = np.zeros((h, w), dtype=np.float32)
 
-    if heat_points:
-        heat_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        draw_heat = ImageDraw.Draw(heat_layer, "RGBA")
-        for hp in heat_points:
-            x = hp["x"] * w
-            y = hp["y"] * h
-            r = hp["radius"] * min(w, h)
-            intensity = hp["intensity"]
-            alpha = int(110 + intensity * 90)
-            draw_heat.ellipse(
-                (x - r, y - r, x + r, y + r),
-                fill=(255, 115, 35, alpha),
-            )
-        heat_layer = heat_layer.filter(ImageFilter.GaussianBlur(radius=max(6, min(w, h) * 0.012)))
-        overlay = Image.alpha_composite(overlay, heat_layer)
+    for zone, zone_weight in zone_weights(zones):
+        for cx_n, cy_n, r_n, intensity, weight in ZONE_MAP.get(zone, []):
+            cx = int(cx_n * w)
+            cy = int(cy_n * h)
+            radius = max(12, int(r_n * min(w, h)))
 
-    if outline_points and len(outline_points) >= 3:
-        draw_outline = ImageDraw.Draw(overlay, "RGBA")
-        pts = [(p[0] * w, p[1] * h) for p in outline_points]
-        draw_outline.line(pts + [pts[0]], fill=(72, 255, 160, 230), width=max(3, int(min(w, h) * 0.005)))
+            y, x = np.ogrid[:h, :w]
+            dist2 = (x - cx) ** 2 + (y - cy) ** 2
+            sigma2 = max(1.0, (radius * 0.75) ** 2)
+            blob = np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
+            heat += blob * intensity * zone_weight * weight
 
-    combined = Image.alpha_composite(base, overlay)
+    if float(heat.max()) <= 1e-6:
+        out = io.BytesIO()
+        base.save(out, format="PNG")
+        return f"data:image/png;base64,{base64.b64encode(out.getvalue()).decode('utf-8')}"
+
+    heat = heat / float(heat.max())
+    heat = np.clip(heat, 0.0, 1.0)
+
+    # smoother and broader
+    heat_uint8 = (heat * 255).astype(np.uint8)
+    heat_uint8 = cv2.GaussianBlur(heat_uint8, (0, 0), sigmaX=max(8, min(w, h) * 0.02), sigmaY=max(8, min(w, h) * 0.02))
+    heat = heat_uint8.astype(np.float32) / 255.0
+
+    # yellow -> orange -> red gradient
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    low = np.clip(1.0 - np.maximum(0.0, heat - 0.0) / 0.5, 0.0, 1.0)
+    high = np.clip((heat - 0.5) / 0.5, 0.0, 1.0)
+
+    # start at yellow, deepen to orange/red
+    rgba[..., 0] = np.clip(255, 0, 255)  # R
+    rgba[..., 1] = np.clip((235 * low + 40 * high), 0, 255).astype(np.uint8)  # G
+    rgba[..., 2] = np.clip((40 * low + 0 * high), 0, 255).astype(np.uint8)    # B
+
+    alpha = np.clip((heat ** 0.9) * 210, 0, 210).astype(np.uint8)
+    rgba[..., 3] = alpha
+
+    overlay_img = Image.fromarray(rgba, mode="RGBA")
+    combined = Image.alpha_composite(base, overlay_img)
+
     out = io.BytesIO()
     combined.save(out, format="PNG")
-    b64 = base64.b64encode(out.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
+    return f"data:image/png;base64,{base64.b64encode(out.getvalue()).decode('utf-8')}"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -946,7 +915,7 @@ def health():
     return {
         "ok": True,
         "service": "checkmyrun-api",
-        "marker": "HYBRID-YOLO-OPENAI-V1",
+        "marker": "HYBRID-YOLO-OPENAI-HEATMAP-V2",
         "model": OPENAI_MODEL,
     }
 
@@ -977,21 +946,11 @@ async def analyze(
 
         data = call_openai_vision(left_url, right_url, rear_url)
 
-        data["left_outline"] = normalize_outline(data.get("left_outline"))
-        data["right_outline"] = normalize_outline(data.get("right_outline"))
-        data["left_heat_points"] = normalize_heat_points(data.get("left_heat_points"))
-        data["right_heat_points"] = normalize_heat_points(data.get("right_heat_points"))
+        left_zones = [normalise_zone_name(z) for z in data.get("left", {}).get("wear_zones", [])]
+        right_zones = [normalise_zone_name(z) for z in data.get("right", {}).get("wear_zones", [])]
 
-        data["left_overlay_data_url"] = make_overlay_png(
-            left_crop_bytes,
-            data.get("left_outline"),
-            data.get("left_heat_points", []),
-        )
-        data["right_overlay_data_url"] = make_overlay_png(
-            right_crop_bytes,
-            data.get("right_outline"),
-            data.get("right_heat_points", []),
-        )
+        data["left_heatmap_data_url"] = make_zone_heatmap(left_crop_bytes, left_zones)
+        data["right_heatmap_data_url"] = make_zone_heatmap(right_crop_bytes, right_zones)
 
         data["debug"] = {
             "left_yolo": left_debug,
