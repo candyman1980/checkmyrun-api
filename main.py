@@ -1,21 +1,28 @@
-import os
-import io
 import cv2
-import base64
-import numpy as np
-import httpx
-from PIL import Image
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
-
 cv2.setNumThreads(1)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = "gpt-4.1"
+import base64
+import io
+import json
+import os
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
 
-app = FastAPI()
+import httpx
+import numpy as np
+from PIL import Image
+
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from ultralytics import YOLOWorld
+
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+
+app = FastAPI(title="CheckMyRun")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,270 +31,875 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Load YOLO once
-# -----------------------------
-
-model = YOLO("yolov8n.pt")
-
-# -----------------------------
-# Simple UI
-# -----------------------------
-
-INDEX_HTML = """
+INDEX_HTML = r"""
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<title>CheckMyRun</title>
-<style>
-body{font-family:system-ui;margin:30px;background:#fafafa}
-.card{max-width:1100px;margin:auto;background:white;padding:20px;border-radius:12px;border:1px solid #ddd}
-.upload{border:2px dashed #ccc;padding:30px;text-align:center;border-radius:10px;margin-bottom:20px;cursor:pointer}
-.upload img{max-width:100%;margin-top:10px}
-.result img{max-width:100%;border:1px solid #ddd;margin-top:10px}
-button{padding:10px 18px;font-weight:bold}
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CheckMyRun</title>
+  <style>
+    :root{
+      --bg:#fafafa;
+      --card:#ffffff;
+      --line:#e6e6e6;
+      --muted:#666;
+      --text:#111;
+      --warn:#b00020;
+    }
+    *{box-sizing:border-box}
+    body{
+      font-family:system-ui,Segoe UI,Helvetica,Arial,sans-serif;
+      margin:24px;
+      background:var(--bg);
+      color:var(--text);
+    }
+    .wrap{
+      max-width:1280px;
+      margin:0 auto;
+      background:var(--card);
+      border:1px solid var(--line);
+      border-radius:16px;
+      padding:20px;
+    }
+    h1{margin:0 0 10px 0}
+    .hint{
+      background:#f7f7f7;
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:14px 16px;
+      color:#444;
+      line-height:1.45;
+      margin-bottom:18px;
+    }
+    .hint ul{margin:8px 0 0 20px;padding:0}
+    .uploadGrid{
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+      gap:16px;
+    }
+    .uploadCard{
+      background:#fff;
+      border:1px solid var(--line);
+      border-radius:14px;
+      padding:14px;
+    }
+    .uploadCard h3{
+      margin:0 0 10px 0;
+      font-size:20px;
+    }
+    .frameLabel{
+      display:block;
+      cursor:pointer;
+    }
+    .previewBox{
+      position:relative;
+      min-height:220px;
+      border:2px dashed #d5d5d5;
+      border-radius:12px;
+      overflow:hidden;
+      background:#fcfcfc;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
+    .previewBox:hover{
+      border-color:#999;
+      background:#f7f7f7;
+    }
+    .previewBox img{
+      width:100%;
+      height:auto;
+      display:block;
+      object-fit:contain;
+      max-height:520px;
+      position:relative;
+      z-index:1;
+    }
+    .placeholder{
+      color:#888;
+      font-size:14px;
+      text-align:center;
+      padding:20px;
+      line-height:1.45;
+      position:relative;
+      z-index:1;
+    }
+    .hiddenFileInput{display:none}
+    .fileMeta{
+      margin-top:10px;
+      font-size:13px;
+      color:var(--muted);
+      min-height:18px;
+      word-break:break-word;
+    }
+    button{
+      padding:11px 16px;
+      border-radius:10px;
+      border:1px solid #111;
+      background:#fff;
+      cursor:pointer;
+      font-weight:700;
+    }
+    .result-grid{
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+      gap:14px;
+      margin-top:12px;
+    }
+    .result-card, .heatmap-card{
+      background:#fff;
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:14px;
+    }
+    .heatmap-grid{
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+      gap:16px;
+      margin-top:16px;
+    }
+    .heatmap-card img{
+      max-width:100%;
+      border:1px solid #ddd;
+      border-radius:8px;
+      display:block;
+      margin-top:10px;
+    }
+    .muted{color:var(--muted)}
+    pre{
+      background:#f4f6f8;
+      padding:12px;
+      border-radius:8px;
+      overflow:auto;
+      max-height:420px;
+      white-space:pre-wrap;
+    }
+    .sectionTitle{
+      margin-top:26px;
+      margin-bottom:10px;
+    }
+    .errorText{
+      color:var(--warn);
+      font-weight:700;
+    }
+  </style>
 </head>
 <body>
+  <div class="wrap">
+    <h1>CheckMyRun</h1>
 
-<div class="card">
+    <div class="hint">
+      Best results:
+      <ul>
+        <li>one sole per frame, filling most of the image</li>
+        <li>camera as straight-on as possible</li>
+        <li>keep fingers low on the heel edge if you have to hold the shoe</li>
+        <li>plain background helps</li>
+      </ul>
+    </div>
 
-<h1>CheckMyRun</h1>
+    <form id="form" enctype="multipart/form-data">
+      <div class="uploadGrid">
+        <div class="uploadCard">
+          <h3>Left sole</h3>
+          <label class="frameLabel" for="leftInput">
+            <div class="previewBox">
+              <img id="leftPreview" style="display:none" alt="Left preview">
+              <div id="leftPlaceholder" class="placeholder">Tap here to upload the left sole photo</div>
+            </div>
+          </label>
+          <input id="leftInput" class="hiddenFileInput" type="file" name="left" accept="image/*" required>
+          <div id="leftMeta" class="fileMeta"></div>
+        </div>
 
-<form id="form">
+        <div class="uploadCard">
+          <h3>Right sole</h3>
+          <label class="frameLabel" for="rightInput">
+            <div class="previewBox">
+              <img id="rightPreview" style="display:none" alt="Right preview">
+              <div id="rightPlaceholder" class="placeholder">Tap here to upload the right sole photo</div>
+            </div>
+          </label>
+          <input id="rightInput" class="hiddenFileInput" type="file" name="right" accept="image/*" required>
+          <div id="rightMeta" class="fileMeta"></div>
+        </div>
 
-<div class="upload">
-<input type="file" name="left" id="left" accept="image/*" required>
-<p>Upload LEFT sole</p>
-<img id="leftPreview">
-</div>
+        <div class="uploadCard">
+          <h3>Rear photo</h3>
+          <label class="frameLabel" for="rearInput">
+            <div class="previewBox">
+              <img id="rearPreview" style="display:none" alt="Rear preview">
+              <div id="rearPlaceholder" class="placeholder">Tap here to upload the rear photo (optional)</div>
+            </div>
+          </label>
+          <input id="rearInput" class="hiddenFileInput" type="file" name="rear" accept="image/*">
+          <div id="rearMeta" class="fileMeta"></div>
+        </div>
+      </div>
 
-<div class="upload">
-<input type="file" name="right" id="right" accept="image/*" required>
-<p>Upload RIGHT sole</p>
-<img id="rightPreview">
-</div>
+      <div style="margin-top:16px">
+        <button id="btn" type="submit">Analyse</button>
+        <span id="status" style="margin-left:12px;color:#666"></span>
+      </div>
+    </form>
 
-<button>Analyse</button>
+    <div id="result" style="margin-top:22px;display:none">
+      <h2 class="sectionTitle">Result</h2>
+      <div id="summary"></div>
 
-</form>
+      <div class="result-grid">
+        <div class="result-card">
+          <h3>Left</h3>
+          <div id="leftResult"></div>
+        </div>
 
-<div id="result"></div>
+        <div class="result-card">
+          <h3>Right</h3>
+          <div id="rightResult"></div>
+        </div>
 
-</div>
+        <div class="result-card">
+          <h3>Overall</h3>
+          <div id="overallResult"></div>
+        </div>
+      </div>
+
+      <h2 class="sectionTitle">Heatmaps</h2>
+      <div class="heatmap-grid">
+        <div class="heatmap-card">
+          <h3>Left heatmap</h3>
+          <div id="leftHeatmapWrap" class="muted">No heatmap returned yet.</div>
+        </div>
+
+        <div class="heatmap-card">
+          <h3>Right heatmap</h3>
+          <div id="rightHeatmapWrap" class="muted">No heatmap returned yet.</div>
+        </div>
+      </div>
+
+      <details style="margin-top:18px">
+        <summary>Raw JSON</summary>
+        <pre id="json"></pre>
+      </details>
+    </div>
+  </div>
 
 <script>
+const API = "/analyze";
 
-function preview(input,img){
+const form = document.getElementById("form");
+const btn = document.getElementById("btn");
+const status = document.getElementById("status");
+const result = document.getElementById("result");
+const summary = document.getElementById("summary");
+const leftResult = document.getElementById("leftResult");
+const rightResult = document.getElementById("rightResult");
+const overallResult = document.getElementById("overallResult");
+const leftHeatmapWrap = document.getElementById("leftHeatmapWrap");
+const rightHeatmapWrap = document.getElementById("rightHeatmapWrap");
+const jsonOut = document.getElementById("json");
 
-input.onchange=()=>{
-const f=input.files[0]
-if(!f)return
-img.src=URL.createObjectURL(f)
+const leftInput = document.getElementById("leftInput");
+const rightInput = document.getElementById("rightInput");
+const rearInput = document.getElementById("rearInput");
+
+const leftPreview = document.getElementById("leftPreview");
+const rightPreview = document.getElementById("rightPreview");
+const rearPreview = document.getElementById("rearPreview");
+
+const leftPlaceholder = document.getElementById("leftPlaceholder");
+const rightPlaceholder = document.getElementById("rightPlaceholder");
+const rearPlaceholder = document.getElementById("rearPlaceholder");
+
+const leftMeta = document.getElementById("leftMeta");
+const rightMeta = document.getElementById("rightMeta");
+const rearMeta = document.getElementById("rearMeta");
+
+function prettyLabel(v) {
+  if (!v) return "—";
+  return String(v).replace(/_/g, " ").replace(/-/g, " ");
 }
 
+function showPreview(input, imgEl, placeholderEl, metaEl) {
+  const file = input.files && input.files[0];
+  if (!file) {
+    imgEl.style.display = "none";
+    imgEl.src = "";
+    placeholderEl.style.display = "block";
+    metaEl.textContent = "";
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  imgEl.src = url;
+  imgEl.style.display = "block";
+  placeholderEl.style.display = "none";
+  metaEl.textContent = file.name;
 }
 
-preview(
-document.getElementById("left"),
-document.getElementById("leftPreview")
-)
-
-preview(
-document.getElementById("right"),
-document.getElementById("rightPreview")
-)
-
-document.getElementById("form").onsubmit=async(e)=>{
-
-e.preventDefault()
-
-const fd=new FormData(e.target)
-
-const r=await fetch("/analyze",{method:"POST",body:fd})
-
-const j=await r.json()
-
-document.getElementById("result").innerHTML=`
-<h2>Analysis</h2>
-<p>${j.analysis}</p>
-
-<h3>Left heatmap</h3>
-<img src="${j.left_heatmap}">
-
-<h3>Right heatmap</h3>
-<img src="${j.right_heatmap}">
-`
+function safeSetImage(container, dataUrl, altText) {
+  container.innerHTML = "";
+  if (!dataUrl || typeof dataUrl !== "string") {
+    container.innerHTML = '<span class="muted">No image returned.</span>';
+    return;
+  }
+  const trimmed = dataUrl.trim();
+  if (!trimmed.startsWith("data:image/")) {
+    container.innerHTML = '<span class="muted">Image returned in unexpected format.</span>';
+    return;
+  }
+  try {
+    const img = document.createElement("img");
+    img.alt = altText;
+    img.src = trimmed;
+    container.appendChild(img);
+  } catch (e) {
+    container.innerHTML = '<span class="muted">Could not display image.</span>';
+  }
 }
 
+leftInput.addEventListener("change", () => showPreview(leftInput, leftPreview, leftPlaceholder, leftMeta));
+rightInput.addEventListener("change", () => showPreview(rightInput, rightPreview, rightPlaceholder, rightMeta));
+rearInput.addEventListener("change", () => showPreview(rearInput, rearPreview, rearPlaceholder, rearMeta));
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  btn.disabled = true;
+  status.textContent = "Uploading...";
+  result.style.display = "none";
+  summary.innerHTML = "";
+  leftResult.innerHTML = "";
+  rightResult.innerHTML = "";
+  overallResult.innerHTML = "";
+  leftHeatmapWrap.innerHTML = '<span class="muted">No heatmap returned yet.</span>';
+  rightHeatmapWrap.innerHTML = '<span class="muted">No heatmap returned yet.</span>';
+  jsonOut.textContent = "";
+
+  try {
+    const fd = new FormData(form);
+    const res = await fetch(API, { method: "POST", body: fd });
+
+    const rawText = await res.text();
+    jsonOut.textContent = rawText;
+    result.style.display = "block";
+
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      throw new Error("Server did not return valid JSON. Check Raw JSON below.");
+    }
+
+    if (!res.ok) {
+      throw new Error(data.detail || JSON.stringify(data));
+    }
+
+    summary.innerHTML = `
+      <p><strong>Overall:</strong> ${data.analysis_text || "Analysis complete."}</p>
+      <p><strong>Overall pronation:</strong> ${prettyLabel(data.overall?.pronation)}</p>
+      <p><strong>Shoe category:</strong> ${prettyLabel(data.overall?.shoe_category)}</p>
+      <p><strong>Confidence:</strong> ${Math.round((data.overall?.confidence || 0) * 100)}%</p>
+    `;
+
+    leftResult.innerHTML = `
+      <p><strong>Pronation:</strong> ${prettyLabel(data.left?.pronation)}</p>
+      <p><strong>Confidence:</strong> ${Math.round((data.left?.confidence || 0) * 100)}%</p>
+      <p>${data.left?.notes || ""}</p>
+      <p><strong>Wear zones:</strong> ${(data.left?.wear_zones || []).map(prettyLabel).join(", ") || "None obvious"}</p>
+    `;
+
+    rightResult.innerHTML = `
+      <p><strong>Pronation:</strong> ${prettyLabel(data.right?.pronation)}</p>
+      <p><strong>Confidence:</strong> ${Math.round((data.right?.confidence || 0) * 100)}%</p>
+      <p>${data.right?.notes || ""}</p>
+      <p><strong>Wear zones:</strong> ${(data.right?.wear_zones || []).map(prettyLabel).join(", ") || "None obvious"}</p>
+    `;
+
+    overallResult.innerHTML = `
+      <p><strong>Pronation:</strong> ${prettyLabel(data.overall?.pronation)}</p>
+      <p><strong>Shoe category:</strong> ${prettyLabel(data.overall?.shoe_category)}</p>
+      <p><strong>Confidence:</strong> ${Math.round((data.overall?.confidence || 0) * 100)}%</p>
+    `;
+
+    safeSetImage(leftHeatmapWrap, data.left_heatmap_data_url, "Left heatmap");
+    safeSetImage(rightHeatmapWrap, data.right_heatmap_data_url, "Right heatmap");
+
+    status.textContent = "Done ✅";
+  } catch (err) {
+    status.textContent = "Error";
+    summary.innerHTML = `<p class="errorText">${err.message || String(err)}</p>`;
+    result.style.display = "block";
+  } finally {
+    btn.disabled = false;
+  }
+});
 </script>
-
 </body>
 </html>
 """
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return INDEX_HTML
+VISION_SCHEMA: Dict[str, Any] = {
+    "name": "checkmyrun_sole_analysis",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "analysis_text": {"type": "string"},
+            "left": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "pronation": {
+                        "type": "string",
+                        "enum": ["overpronation", "underpronation", "neutral", "unclear"]
+                    },
+                    "confidence": {"type": "number"},
+                    "notes": {"type": "string"},
+                    "wear_zones": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["pronation", "confidence", "notes", "wear_zones"]
+            },
+            "right": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "pronation": {
+                        "type": "string",
+                        "enum": ["overpronation", "underpronation", "neutral", "unclear"]
+                    },
+                    "confidence": {"type": "number"},
+                    "notes": {"type": "string"},
+                    "wear_zones": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["pronation", "confidence", "notes", "wear_zones"]
+            },
+            "overall": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "pronation": {
+                        "type": "string",
+                        "enum": ["overpronation", "underpronation", "neutral", "unclear"]
+                    },
+                    "shoe_category": {
+                        "type": "string",
+                        "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]
+                    },
+                    "confidence": {"type": "number"}
+                },
+                "required": ["pronation", "shoe_category", "confidence"]
+            }
+        },
+        "required": ["analysis_text", "left", "right", "overall"]
+    }
+}
 
-# -----------------------------
-# Image utilities
-# -----------------------------
+SYSTEM_PROMPT = """
+You are analysing running shoe outsole wear from photos.
 
-def decode(bytes):
+You will receive cropped sole images that have already been localized, but may still contain small amounts of hand or background near the heel.
+You must identify only the outsole itself and ignore hands, wrists, sleeves, watches, floor, bags, chairs, and background clutter.
 
-    arr=np.frombuffer(bytes,np.uint8)
-    img=cv2.imdecode(arr,cv2.IMREAD_COLOR)
+Return JSON only.
 
-    return img
+Rules:
+- Be object-aware.
+- Prefer useful insight over blandness.
+- Lower confidence if the evidence is weak.
+- Notes should mention asymmetry where relevant.
+- wear_zones should use labels from this set when possible:
+  lateral heel
+  central heel
+  medial heel
+  lateral forefoot
+  central forefoot
+  medial forefoot
+  lateral midfoot
+  medial midfoot
+"""
 
-def encode(img):
+USER_PROMPT = """
+Analyse the attached cropped sole photos.
 
-    _,buf=cv2.imencode(".png",img)
+Return:
+1. left/right/overall pronation judgement
+2. a useful written analysis
+3. concise notes for each shoe
+4. ordered wear_zones for each shoe from strongest to weaker
+"""
 
-    return buf.tobytes()
+# cx, cy, radius, intensity, weight
+ZONE_MAP: Dict[str, List[Tuple[float, float, float, float, float]]] = {
+    "lateral heel": [
+        (0.22, 0.79, 0.08, 1.00, 1.00),
+        (0.27, 0.73, 0.06, 0.75, 0.70),
+    ],
+    "central heel": [
+        (0.50, 0.80, 0.08, 0.95, 1.00),
+        (0.50, 0.72, 0.06, 0.70, 0.68),
+    ],
+    "medial heel": [
+        (0.78, 0.79, 0.08, 1.00, 1.00),
+        (0.73, 0.73, 0.06, 0.75, 0.70),
+    ],
+    "lateral midfoot": [
+        (0.27, 0.57, 0.06, 0.78, 0.90),
+    ],
+    "medial midfoot": [
+        (0.73, 0.57, 0.06, 0.78, 0.90),
+    ],
+    "lateral forefoot": [
+        (0.26, 0.28, 0.08, 0.95, 1.00),
+        (0.20, 0.35, 0.06, 0.65, 0.68),
+    ],
+    "central forefoot": [
+        (0.50, 0.29, 0.08, 0.95, 1.00),
+        (0.50, 0.37, 0.06, 0.68, 0.68),
+    ],
+    "medial forefoot": [
+        (0.74, 0.28, 0.08, 0.95, 1.00),
+        (0.80, 0.35, 0.06, 0.65, 0.68),
+    ],
+}
 
-# -----------------------------
-# YOLO sole detection
-# -----------------------------
 
-def crop_sole(img):
+@lru_cache(maxsize=1)
+def get_yolo_world():
+    model = YOLOWorld("yolov8s-world.pt")
+    model.set_classes(["shoe sole", "outsole", "hand"])
+    return model
 
-    res=model.predict(img,conf=0.25,verbose=False)[0]
 
-    if res.boxes is None:
-        raise Exception("No sole detected")
+def _default_payload(error: str) -> Dict[str, Any]:
+    return {"detail": error}
 
-    boxes=res.boxes.xyxy.cpu().numpy()
 
-    best=None
-    best_area=0
+def _file_to_data_url(file_bytes: bytes, filename: str) -> str:
+    name = (filename or "").lower()
+    if name.endswith(".png"):
+        mime = "image/png"
+    elif name.endswith(".webp"):
+        mime = "image/webp"
+    else:
+        mime = "image/jpeg"
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
-    for b in boxes:
 
-        x1,y1,x2,y2=b
+def decode_image(base_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(base_bytes, np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("Could not decode image")
+    h, w = img_bgr.shape[:2]
+    scale = 1280 / max(h, w)
+    if scale < 1:
+        img_bgr = cv2.resize(img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return img_bgr
 
-        area=(x2-x1)*(y2-y1)
 
-        if area>best_area:
-            best=b
-            best_area=area
+def detect_world_boxes(img_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    model = get_yolo_world()
+    results = model.predict(img_bgr, imgsz=640, conf=0.12, verbose=False)
+    r = results[0]
 
-    x1,y1,x2,y2=map(int,best)
+    out: List[Dict[str, Any]] = []
+    if r.boxes is None:
+        return out
 
-    return img[y1:y2,x1:x2]
+    boxes = r.boxes.xyxy.cpu().numpy()
+    confs = r.boxes.conf.cpu().numpy()
+    clss = r.boxes.cls.cpu().numpy().astype(int)
+    names = r.names
 
-# -----------------------------
-# Sole mask (OpenCV segmentation)
-# -----------------------------
+    for box, conf, cls_id in zip(boxes, confs, clss):
+        out.append({
+            "xyxy": [float(v) for v in box.tolist()],
+            "conf": float(conf),
+            "label": str(names[int(cls_id)]).lower(),
+        })
+    return out
 
-def mask_sole(img):
 
-    gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+def score_sole_candidate(box: List[float], conf: float, img_shape: Tuple[int, int, int]) -> float:
+    h, w = img_shape[:2]
+    x1, y1, x2, y2 = box
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    area_ratio = (bw * bh) / float(h * w)
+    aspect = bh / max(1.0, bw)
+    cx = (x1 + x2) / 2.0
+    center_score = 1.0 - abs(cx - (w / 2.0)) / (w / 2.0)
 
-    _,th=cv2.threshold(gray,220,255,cv2.THRESH_BINARY_INV)
+    if area_ratio < 0.04:
+        return -1e9
 
-    kernel=np.ones((7,7),np.uint8)
+    score = 0.0
+    score += 1.6 * conf
+    score += 2.0 * min(1.0, area_ratio / 0.24)
+    score += 1.0 * max(0.0, min(1.0, center_score))
+    score += 0.4 * max(0.0, min(2.0, aspect))
+    return score
 
-    th=cv2.morphologyEx(th,cv2.MORPH_CLOSE,kernel)
 
-    cnts,_=cv2.findContours(th,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+def choose_best_sole_box(detections: List[Dict[str, Any]], img_shape: Tuple[int, int, int]) -> List[float]:
+    sole_like = [d for d in detections if d["label"] in {"shoe sole", "outsole"}]
+    if not sole_like:
+        raise ValueError("Could not find the sole cleanly. Retake the photo with the sole larger in frame.")
+    return max(sole_like, key=lambda d: score_sole_candidate(d["xyxy"], d["conf"], img_shape))["xyxy"]
 
-    if not cnts:
-        return np.ones(gray.shape,np.uint8)
 
-    largest=max(cnts,key=cv2.contourArea)
+def expand_box(box: List[float], img_shape: Tuple[int, int, int], pad_x: float = 0.10, pad_y_top: float = 0.08, pad_y_bottom: float = 0.02) -> Tuple[int, int, int, int]:
+    h, w = img_shape[:2]
+    x1, y1, x2, y2 = box
+    bw = x2 - x1
+    bh = y2 - y1
+    nx1 = max(0, int(round(x1 - bw * pad_x)))
+    ny1 = max(0, int(round(y1 - bh * pad_y_top)))
+    nx2 = min(w, int(round(x2 + bw * pad_x)))
+    ny2 = min(h, int(round(y2 + bh * pad_y_bottom)))
+    return nx1, ny1, nx2, ny2
 
-    mask=np.zeros(gray.shape,np.uint8)
 
-    cv2.drawContours(mask,[largest],-1,255,-1)
+def crop_from_yolo(base_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
+    img_bgr = decode_image(base_bytes)
+    detections = detect_world_boxes(img_bgr)
+    sole_box = choose_best_sole_box(detections, img_bgr.shape)
+    crop_box = expand_box(sole_box, img_bgr.shape)
 
+    x1, y1, x2, y2 = crop_box
+    crop = img_bgr[y1:y2, x1:x2].copy()
+
+    ok, enc = cv2.imencode(".png", crop)
+    if not ok:
+        raise ValueError("Could not encode cropped sole image.")
+
+    debug = {
+        "detections": detections,
+        "sole_box": sole_box,
+        "crop_box": crop_box,
+    }
+    return enc.tobytes(), debug
+
+
+def _extract_json_from_response(resp_json: Dict[str, Any]) -> Dict[str, Any]:
+    output_text = resp_json.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return json.loads(output_text)
+
+    for item in resp_json.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
+                txt = content["text"].strip()
+                if txt:
+                    return json.loads(txt)
+
+    raise ValueError("Could not extract structured JSON from model response.")
+
+
+def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -> Dict[str, Any]:
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY is not set.")
+
+    content: List[Dict[str, Any]] = [
+        {"type": "input_text", "text": USER_PROMPT},
+        {"type": "input_text", "text": "LEFT CROPPED SOLE IMAGE"},
+        {"type": "input_image", "image_url": left_url},
+        {"type": "input_text", "text": "RIGHT CROPPED SOLE IMAGE"},
+        {"type": "input_image", "image_url": right_url},
+    ]
+    if rear_url:
+        content.append({"type": "input_text", "text": "OPTIONAL REAR IMAGE"})
+        content.append({"type": "input_image", "image_url": rear_url})
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
+            {"role": "user", "content": content},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": VISION_SCHEMA["name"],
+                "schema": VISION_SCHEMA["schema"],
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 1400,
+    }
+
+    with httpx.Client(timeout=90.0) as client:
+        r = client.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    if r.status_code != 200:
+        raise ValueError(f"OpenAI error {r.status_code}: {r.text}")
+
+    return _extract_json_from_response(r.json())
+
+
+def normalise_zone_name(zone: str) -> str:
+    z = str(zone or "").strip().lower()
+    return z.replace("_", " ").replace("-", " ")
+
+
+def zone_weights(zones: List[str]) -> List[Tuple[str, float]]:
+    cleaned: List[str] = []
+    seen = set()
+
+    for z in zones:
+        nz = normalise_zone_name(z)
+        if nz in ZONE_MAP and nz not in seen:
+            cleaned.append(nz)
+            seen.add(nz)
+
+    weights: List[Tuple[str, float]] = []
+    for i, z in enumerate(cleaned):
+        weight = max(0.50, 1.0 - i * 0.18)
+        weights.append((z, weight))
+    return weights
+
+
+def build_crop_mask(base_img_bytes: bytes) -> np.ndarray:
+    base = Image.open(io.BytesIO(base_img_bytes)).convert("RGB")
+    arr = np.array(base)
+    h, w = arr.shape[:2]
+
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    _, mask = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY_INV)
+
+    kernel = np.ones((9, 9), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    mask[int(h * 0.92):, :] = 0
     return mask
 
-# -----------------------------
-# Wear heatmap
-# -----------------------------
 
-def heatmap(img):
+def make_zone_heatmap(base_img_bytes: bytes, zones: List[str]) -> str:
+    base = Image.open(io.BytesIO(base_img_bytes)).convert("RGBA")
+    w, h = base.size
 
-    hsv=cv2.cvtColor(img,cv2.COLOR_BGR2HSV)
+    heat = np.zeros((h, w), dtype=np.float32)
+    crop_mask = build_crop_mask(base_img_bytes).astype(np.float32) / 255.0
 
-    s=hsv[:,:,1]
+    cutoff_y = int(h * 0.90)
 
-    blur=cv2.GaussianBlur(s,(0,0),15)
+    for zone, zone_weight in zone_weights(zones):
+        for cx_n, cy_n, r_n, intensity, weight in ZONE_MAP.get(zone, []):
+            cx = int(cx_n * w)
+            cy = int(cy_n * h)
 
-    norm=cv2.normalize(blur,None,0,255,cv2.NORM_MINMAX)
+            if cy > cutoff_y:
+                continue
 
-    heat=cv2.applyColorMap(norm,cv2.COLORMAP_JET)
+            radius = max(10, int(r_n * min(w, h)))
 
-    overlay=cv2.addWeighted(img,0.6,heat,0.4,0)
+            y, x = np.ogrid[:h, :w]
+            dist2 = (x - cx) ** 2 + (y - cy) ** 2
 
-    return overlay
+            sigma2 = max(1.0, (radius * 0.58) ** 2)
+            blob = np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
 
-# -----------------------------
-# OpenAI analysis
-# -----------------------------
+            heat += blob * intensity * zone_weight * weight
 
-def analyze_ai(left,right):
+    heat *= crop_mask
 
-    l="data:image/png;base64,"+base64.b64encode(left).decode()
-    r="data:image/png;base64,"+base64.b64encode(right).decode()
+    if float(heat.max()) <= 1e-6:
+        out = io.BytesIO()
+        base.save(out, format="PNG")
+        return f"data:image/png;base64,{base64.b64encode(out.getvalue()).decode('utf-8')}"
 
-    payload={
-    "model":MODEL,
-    "input":[{
-        "role":"user",
-        "content":[
-        {"type":"input_text","text":"Analyse running shoe wear and pronation."},
-        {"type":"input_image","image_url":l},
-        {"type":"input_image","image_url":r}
-        ]
-    }]
+    heat = heat / float(heat.max())
+    heat_uint = (heat * 255).astype(np.uint8)
+    heat_uint = cv2.GaussianBlur(
+        heat_uint,
+        (0, 0),
+        sigmaX=max(10, int(min(w, h) * 0.018)),
+        sigmaY=max(10, int(min(w, h) * 0.018)),
+    )
+    heat = heat_uint.astype(np.float32) / 255.0
+
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[..., 0] = 255
+    rgba[..., 1] = np.clip(235 - heat * 215, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(40 - heat * 40, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip((heat ** 1.15) * 195, 0, 195).astype(np.uint8)
+
+    overlay = Image.fromarray(rgba, "RGBA")
+    combined = Image.alpha_composite(base, overlay)
+
+    out = io.BytesIO()
+    combined.save(out, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(out.getvalue()).decode('utf-8')}"
+
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return HTMLResponse(content=INDEX_HTML, status_code=200)
+
+
+@app.head("/")
+def head_root():
+    return HTMLResponse(status_code=200)
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "service": "checkmyrun-api",
+        "marker": "HYBRID-YOLO-OPENAI-HEATMAP-V3",
+        "model": OPENAI_MODEL,
     }
 
-    resp=httpx.post(
-    "https://api.openai.com/v1/responses",
-    headers={
-    "Authorization":f"Bearer {OPENAI_API_KEY}"
-    },
-    json=payload,
-    timeout=60
-    )
-
-    data=resp.json()
-
-    return data["output_text"]
-
-# -----------------------------
-# API endpoint
-# -----------------------------
 
 @app.post("/analyze")
-async def analyze(left:UploadFile=File(...),right:UploadFile=File(...)):
+@app.post("/analyse")
+@app.post("/api/analyze")
+@app.post("/api/analyse")
+async def analyze(
+    left: UploadFile = File(...),
+    right: UploadFile = File(...),
+    rear: UploadFile = File(None),
+):
+    try:
+        left_bytes = await left.read()
+        right_bytes = await right.read()
+        rear_bytes = await rear.read() if rear else None
 
-    left_bytes=await left.read()
-    right_bytes=await right.read()
+        if not left_bytes or not right_bytes:
+            return JSONResponse(content=_default_payload("Left and right images are required."), status_code=400)
 
-    left_img=decode(left_bytes)
-    right_img=decode(right_bytes)
+        left_crop_bytes, left_debug = crop_from_yolo(left_bytes)
+        right_crop_bytes, right_debug = crop_from_yolo(right_bytes)
 
-    left_crop=crop_sole(left_img)
-    right_crop=crop_sole(right_img)
+        left_url = _file_to_data_url(left_crop_bytes, "left_crop.png")
+        right_url = _file_to_data_url(right_crop_bytes, "right_crop.png")
+        rear_url = _file_to_data_url(rear_bytes, rear.filename or "rear.jpg") if rear_bytes else None
 
-    left_mask=mask_sole(left_crop)
-    right_mask=mask_sole(right_crop)
+        data = call_openai_vision(left_url, right_url, rear_url)
 
-    left_heat=heatmap(left_crop)
-    right_heat=heatmap(right_crop)
+        left_zones = [normalise_zone_name(z) for z in data.get("left", {}).get("wear_zones", [])]
+        right_zones = [normalise_zone_name(z) for z in data.get("right", {}).get("wear_zones", [])]
 
-    left_heat_bytes=encode(left_heat)
-    right_heat_bytes=encode(right_heat)
+        data["left_heatmap_data_url"] = make_zone_heatmap(left_crop_bytes, left_zones)
+        data["right_heatmap_data_url"] = make_zone_heatmap(right_crop_bytes, right_zones)
 
-    analysis=analyze_ai(left_heat_bytes,right_heat_bytes)
+        data["debug"] = {
+            "left_yolo": left_debug,
+            "right_yolo": right_debug,
+            "rear_supplied": rear is not None,
+        }
 
-    return {
-    "analysis":analysis,
-    "left_heatmap":"data:image/png;base64,"+base64.b64encode(left_heat_bytes).decode(),
-    "right_heatmap":"data:image/png;base64,"+base64.b64encode(right_heat_bytes).decode()
-    }
+        return JSONResponse(content=data, status_code=200)
+
+    except Exception as e:
+        return JSONResponse(content=_default_payload(str(e)), status_code=500)
