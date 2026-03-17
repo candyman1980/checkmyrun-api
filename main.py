@@ -22,6 +22,9 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
+GRID_W = 12
+GRID_H = 20
+
 app = FastAPI(title="CheckMyRun")
 
 app.add_middleware(
@@ -184,7 +187,7 @@ INDEX_HTML = r"""
     <h1>CheckMyRun</h1>
 
     <div class="hint">
-      Upload left and right sole photos. The app will crop each sole, analyse wear, and return a heatmap plus interpretation.
+      Upload left and right sole photos. The app crops each sole, analyses wear, and returns a dense heatmap plus interpretation.
     </div>
 
     <form id="form" enctype="multipart/form-data">
@@ -547,80 +550,70 @@ def crop_from_yolo(base_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
     return enc.tobytes(), debug
 
 
-VISION_SCHEMA: Dict[str, Any] = {
-    "name": "checkmyrun_sole_analysis",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "analysis_text": {"type": "string"},
-            "left": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
-                    "confidence": {"type": "number"},
-                    "notes": {"type": "string"},
-                    "wear_zones": {"type": "array", "items": {"type": "string"}},
-                    "heat_anchors": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "x": {"type": "number"},
-                                "y": {"type": "number"},
-                                "intensity": {"type": "number"},
-                                "radius": {"type": "number"},
-                            },
-                            "required": ["x", "y", "intensity", "radius"],
-                        },
+def make_heat_grid_schema() -> Dict[str, Any]:
+    row_schema = {
+        "type": "array",
+        "minItems": GRID_W,
+        "maxItems": GRID_W,
+        "items": {"type": "number"}
+    }
+    grid_schema = {
+        "type": "array",
+        "minItems": GRID_H,
+        "maxItems": GRID_H,
+        "items": row_schema
+    }
+
+    return {
+        "name": "checkmyrun_sole_analysis",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "analysis_text": {"type": "string"},
+                "left": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "confidence": {"type": "number"},
+                        "notes": {"type": "string"},
+                        "wear_zones": {"type": "array", "items": {"type": "string"}},
+                        "heat_grid": grid_schema,
                     },
+                    "required": ["pronation", "confidence", "notes", "wear_zones", "heat_grid"],
                 },
-                "required": ["pronation", "confidence", "notes", "wear_zones", "heat_anchors"],
-            },
-            "right": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
-                    "confidence": {"type": "number"},
-                    "notes": {"type": "string"},
-                    "wear_zones": {"type": "array", "items": {"type": "string"}},
-                    "heat_anchors": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "x": {"type": "number"},
-                                "y": {"type": "number"},
-                                "intensity": {"type": "number"},
-                                "radius": {"type": "number"},
-                            },
-                            "required": ["x", "y", "intensity", "radius"],
-                        },
+                "right": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "confidence": {"type": "number"},
+                        "notes": {"type": "string"},
+                        "wear_zones": {"type": "array", "items": {"type": "string"}},
+                        "heat_grid": grid_schema,
                     },
+                    "required": ["pronation", "confidence", "notes", "wear_zones", "heat_grid"],
                 },
-                "required": ["pronation", "confidence", "notes", "wear_zones", "heat_anchors"],
-            },
-            "overall": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
-                    "shoe_category": {"type": "string", "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]},
-                    "confidence": {"type": "number"},
+                "overall": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "shoe_category": {"type": "string", "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["pronation", "shoe_category", "confidence"],
                 },
-                "required": ["pronation", "shoe_category", "confidence"],
             },
+            "required": ["analysis_text", "left", "right", "overall"],
         },
-        "required": ["analysis_text", "left", "right", "overall"],
-    },
-}
+    }
 
 
-SYSTEM_PROMPT = """
+VISION_SCHEMA = make_heat_grid_schema()
+
+SYSTEM_PROMPT = f"""
 You are analysing running shoe outsole wear from photos.
 
 You will receive cropped sole images that have already been localized, but may still contain small amounts of hand or background near the heel.
@@ -642,18 +635,16 @@ Rules:
   medial forefoot
   lateral midfoot
   medial midfoot
-- heat_anchors must sit only on genuine wear regions of the outsole.
-- do not place anchors on background, hand, or untouched decorative tread.
-- use 8 to 18 anchors per shoe.
-- include both strongest wear points and broader surrounding worn regions.
-- when a worn patch is visibly broad, use multiple neighbouring anchors rather than a single point.
-- do not be too conservative: obvious worn areas should be represented.
-- x and y are normalized 0 to 1 coordinates within the cropped sole image.
-- intensity is 0 to 1.
-- radius is 0.03 to 0.16.
+- For each shoe, return a heat_grid of exactly {GRID_H} rows by {GRID_W} columns.
+- Each cell is a number from 0.0 to 1.0 representing how worn that region looks.
+- Higher values should cover visibly broad smoothed, polished, darkened, flattened, or abraded rubber.
+- Do not be too conservative.
+- Broad obvious worn areas should occupy multiple neighbouring cells.
+- Do not light up background, hand, or untouched decorative tread.
+- The grid is top-to-bottom and left-to-right over the cropped image.
 """
 
-USER_PROMPT = """
+USER_PROMPT = f"""
 Analyse the attached cropped sole photos.
 
 Return:
@@ -661,9 +652,9 @@ Return:
 2. a useful written analysis
 3. concise notes for each shoe
 4. ordered wear_zones for each shoe from strongest to weaker
-5. heat_anchors for each shoe placed over the actual visible wear
+5. a dense {GRID_H}x{GRID_W} wear heat_grid for each shoe
 
-Be more sensitive to visible smoothed, polished, darkened, flattened, or abraded rubber, especially when the worn area is broad rather than point-like.
+Be more sensitive to broad visible wear, not just peak spots.
 """
 
 
@@ -711,7 +702,7 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
                 "strict": True,
             }
         },
-        "max_output_tokens": 1800,
+        "max_output_tokens": 2200,
     }
 
     with httpx.Client(timeout=90.0) as client:
@@ -738,19 +729,16 @@ def clamp01(x: Any) -> float:
         return 0.0
 
 
-def normalise_anchors(anchors: Any) -> List[Dict[str, float]]:
-    if not isinstance(anchors, list):
-        return []
-    out: List[Dict[str, float]] = []
-    for a in anchors:
-        if not isinstance(a, dict):
+def normalise_grid(grid: Any) -> List[List[float]]:
+    if not isinstance(grid, list) or len(grid) != GRID_H:
+        return [[0.0 for _ in range(GRID_W)] for _ in range(GRID_H)]
+
+    out: List[List[float]] = []
+    for row in grid:
+        if not isinstance(row, list) or len(row) != GRID_W:
+            out.append([0.0 for _ in range(GRID_W)])
             continue
-        out.append({
-            "x": clamp01(a.get("x", 0.5)),
-            "y": clamp01(a.get("y", 0.5)),
-            "intensity": max(0.30, min(1.0, float(a.get("intensity", 0.6)))),
-            "radius": max(0.045, min(0.16, float(a.get("radius", 0.08)))),
-        })
+        out.append([clamp01(v) for v in row])
     return out
 
 
@@ -781,32 +769,31 @@ def build_crop_mask(base_img_bytes: bytes) -> np.ndarray:
         largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
-    mask[int(h * 0.965):, :] = 0
+    mask[int(h * 0.975):, :] = 0
     return mask
 
 
-def make_anchor_heatmap(base_img_bytes: bytes, anchors: List[Dict[str, float]]) -> str:
+def make_grid_heatmap(base_img_bytes: bytes, grid: List[List[float]]) -> str:
     base = Image.open(io.BytesIO(base_img_bytes)).convert("RGBA")
     w, h = base.size
 
-    heat = np.zeros((h, w), dtype=np.float32)
     crop_mask = build_crop_mask(base_img_bytes).astype(np.float32) / 255.0
     crop_mask = cv2.GaussianBlur(crop_mask, (0, 0), sigmaX=max(4, int(min(w, h) * 0.01)))
 
-    for a in anchors:
-        cx = int(a["x"] * w)
-        cy = int(a["y"] * h)
-        radius = max(14, int(a["radius"] * min(w, h)))
-        intensity = max(0.30, a["intensity"])
+    grid_arr = np.array(grid, dtype=np.float32)
+    grid_arr = np.clip(grid_arr, 0.0, 1.0)
+    grid_arr = np.clip(grid_arr ** 0.78, 0.0, 1.0)
 
-        y, x = np.ogrid[:h, :w]
-        dist2 = (x - cx) ** 2 + (y - cy) ** 2
-        sigma2 = max(1.0, (radius * 0.82) ** 2)
-        blob = np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
-
-        heat += blob * intensity
+    heat = cv2.resize(grid_arr, (w, h), interpolation=cv2.INTER_CUBIC)
+    heat = cv2.GaussianBlur(
+        heat,
+        (0, 0),
+        sigmaX=max(18, int(min(w, h) * 0.030)),
+        sigmaY=max(18, int(min(w, h) * 0.030)),
+    )
 
     heat *= crop_mask
+    heat = np.clip(heat, 0.0, 1.0)
 
     if float(heat.max()) <= 1e-6:
         out = io.BytesIO()
@@ -814,17 +801,6 @@ def make_anchor_heatmap(base_img_bytes: bytes, anchors: List[Dict[str, float]]) 
         return f"data:image/png;base64,{base64.b64encode(out.getvalue()).decode('utf-8')}"
 
     heat = heat / float(heat.max())
-
-    heat_uint = (heat * 255).astype(np.uint8)
-    heat_uint = cv2.GaussianBlur(
-        heat_uint,
-        (0, 0),
-        sigmaX=max(16, int(min(w, h) * 0.028)),
-        sigmaY=max(16, int(min(w, h) * 0.028)),
-    )
-
-    heat = heat_uint.astype(np.float32) / 255.0
-    heat = np.clip(heat ** 0.78, 0.0, 1.0)
 
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba[..., 0] = 255
@@ -855,7 +831,7 @@ def health():
     return {
         "ok": True,
         "service": "checkmyrun-api",
-        "marker": "FINAL-CLEAN-HYBRID-V2",
+        "marker": "CHATGPT-GRID-HEATMAP-V1",
         "model": OPENAI_MODEL,
     }
 
@@ -886,11 +862,11 @@ async def analyze(
 
         data = call_openai_vision(left_url, right_url, rear_url)
 
-        left_anchors = normalise_anchors(data.get("left", {}).get("heat_anchors", []))
-        right_anchors = normalise_anchors(data.get("right", {}).get("heat_anchors", []))
+        left_grid = normalise_grid(data.get("left", {}).get("heat_grid"))
+        right_grid = normalise_grid(data.get("right", {}).get("heat_grid"))
 
-        data["left_heatmap_data_url"] = make_anchor_heatmap(left_crop_bytes, left_anchors)
-        data["right_heatmap_data_url"] = make_anchor_heatmap(right_crop_bytes, right_anchors)
+        data["left_heatmap_data_url"] = make_grid_heatmap(left_crop_bytes, left_grid)
+        data["right_heatmap_data_url"] = make_grid_heatmap(right_crop_bytes, right_grid)
 
         data["debug"] = {
             "left_yolo": left_debug,
@@ -902,3 +878,34 @@ async def analyze(
 
     except Exception as e:
         return JSONResponse(content=_default_payload(str(e)), status_code=500)
+```
+
+## `requirements.txt`
+
+```txt
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+httpx==0.27.2
+ultralytics==8.3.0
+```
+
+## Build command
+
+```bash
+pip install -r requirements.txt
+```
+
+## Start command
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 10000
+```
+
+After deploy, `/health` should show:
+
+```json
+"marker":"CHATGPT-GRID-HEATMAP-V1"
