@@ -55,7 +55,7 @@ INDEX_HTML = r"""
       color:var(--text);
     }
     .wrap{
-      max-width:1280px;
+      max-width:1200px;
       margin:0 auto;
       background:var(--card);
       border:1px solid var(--line);
@@ -93,7 +93,6 @@ INDEX_HTML = r"""
       cursor:pointer;
     }
     .previewBox{
-      position:relative;
       min-height:220px;
       border:2px dashed #d5d5d5;
       border-radius:12px;
@@ -113,8 +112,6 @@ INDEX_HTML = r"""
       display:block;
       object-fit:contain;
       max-height:520px;
-      position:relative;
-      z-index:1;
     }
     .placeholder{
       color:#888;
@@ -122,8 +119,6 @@ INDEX_HTML = r"""
       text-align:center;
       padding:20px;
       line-height:1.45;
-      position:relative;
-      z-index:1;
     }
     .hiddenFileInput{display:none}
     .fileMeta{
@@ -190,13 +185,7 @@ INDEX_HTML = r"""
     <h1>CheckMyRun</h1>
 
     <div class="hint">
-      Best results:
-      <ul>
-        <li>one sole per frame, filling most of the image</li>
-        <li>camera as straight-on as possible</li>
-        <li>keep fingers low on the heel edge if you have to hold the shoe</li>
-        <li>plain background helps</li>
-      </ul>
+      Upload left and right sole photos. The app will crop each sole, analyse wear, and return a heatmap plus interpretation.
     </div>
 
     <form id="form" enctype="multipart/form-data">
@@ -343,19 +332,14 @@ function safeSetImage(container, dataUrl, altText) {
     container.innerHTML = '<span class="muted">No image returned.</span>';
     return;
   }
-  const trimmed = dataUrl.trim();
-  if (!trimmed.startsWith("data:image/")) {
+  if (!dataUrl.trim().startsWith("data:image/")) {
     container.innerHTML = '<span class="muted">Image returned in unexpected format.</span>';
     return;
   }
-  try {
-    const img = document.createElement("img");
-    img.alt = altText;
-    img.src = trimmed;
-    container.appendChild(img);
-  } catch (e) {
-    container.innerHTML = '<span class="muted">Could not display image.</span>';
-  }
+  const img = document.createElement("img");
+  img.alt = altText;
+  img.src = dataUrl;
+  container.appendChild(img);
 }
 
 leftInput.addEventListener("change", () => showPreview(leftInput, leftPreview, leftPlaceholder, leftMeta));
@@ -438,135 +422,11 @@ form.addEventListener("submit", async (e) => {
 </html>
 """
 
-VISION_SCHEMA: Dict[str, Any] = {
-    "name": "checkmyrun_sole_analysis",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "analysis_text": {"type": "string"},
-            "left": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "pronation": {
-                        "type": "string",
-                        "enum": ["overpronation", "underpronation", "neutral", "unclear"]
-                    },
-                    "confidence": {"type": "number"},
-                    "notes": {"type": "string"},
-                    "wear_zones": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["pronation", "confidence", "notes", "wear_zones"]
-            },
-            "right": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "pronation": {
-                        "type": "string",
-                        "enum": ["overpronation", "underpronation", "neutral", "unclear"]
-                    },
-                    "confidence": {"type": "number"},
-                    "notes": {"type": "string"},
-                    "wear_zones": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["pronation", "confidence", "notes", "wear_zones"]
-            },
-            "overall": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "pronation": {
-                        "type": "string",
-                        "enum": ["overpronation", "underpronation", "neutral", "unclear"]
-                    },
-                    "shoe_category": {
-                        "type": "string",
-                        "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]
-                    },
-                    "confidence": {"type": "number"}
-                },
-                "required": ["pronation", "shoe_category", "confidence"]
-            }
-        },
-        "required": ["analysis_text", "left", "right", "overall"]
-    }
-}
-
-SYSTEM_PROMPT = """
-You are analysing running shoe outsole wear from photos.
-
-You will receive cropped sole images that have already been localized, but may still contain small amounts of hand or background near the heel.
-You must identify only the outsole itself and ignore hands, wrists, sleeves, watches, floor, bags, chairs, and background clutter.
-
-Return JSON only.
-
-Rules:
-- Be object-aware.
-- Prefer useful insight over blandness.
-- Lower confidence if the evidence is weak.
-- Notes should mention asymmetry where relevant.
-- wear_zones should use labels from this set when possible:
-  lateral heel
-  central heel
-  medial heel
-  lateral forefoot
-  central forefoot
-  medial forefoot
-  lateral midfoot
-  medial midfoot
-"""
-
-USER_PROMPT = """
-Analyse the attached cropped sole photos.
-
-Return:
-1. left/right/overall pronation judgement
-2. a useful written analysis
-3. concise notes for each shoe
-4. ordered wear_zones for each shoe from strongest to weaker
-"""
-
-# cx, cy, radius, intensity, weight
-ZONE_MAP: Dict[str, List[Tuple[float, float, float, float, float]]] = {
-    "lateral heel": [
-        (0.22, 0.79, 0.08, 1.00, 1.00),
-        (0.27, 0.73, 0.06, 0.75, 0.70),
-    ],
-    "central heel": [
-        (0.50, 0.80, 0.08, 0.95, 1.00),
-        (0.50, 0.72, 0.06, 0.70, 0.68),
-    ],
-    "medial heel": [
-        (0.78, 0.79, 0.08, 1.00, 1.00),
-        (0.73, 0.73, 0.06, 0.75, 0.70),
-    ],
-    "lateral midfoot": [
-        (0.27, 0.57, 0.06, 0.78, 0.90),
-    ],
-    "medial midfoot": [
-        (0.73, 0.57, 0.06, 0.78, 0.90),
-    ],
-    "lateral forefoot": [
-        (0.26, 0.28, 0.08, 0.95, 1.00),
-        (0.20, 0.35, 0.06, 0.65, 0.68),
-    ],
-    "central forefoot": [
-        (0.50, 0.29, 0.08, 0.95, 1.00),
-        (0.50, 0.37, 0.06, 0.68, 0.68),
-    ],
-    "medial forefoot": [
-        (0.74, 0.28, 0.08, 0.95, 1.00),
-        (0.80, 0.35, 0.06, 0.65, 0.68),
-    ],
-}
-
 
 @lru_cache(maxsize=1)
 def get_yolo_world():
     model = YOLOWorld("yolov8s-world.pt")
-    model.set_classes(["shoe sole", "outsole", "hand"])
+    model.set_classes(["shoe sole", "outsole", "running shoe sole", "hand"])
     return model
 
 
@@ -643,13 +503,19 @@ def score_sole_candidate(box: List[float], conf: float, img_shape: Tuple[int, in
 
 
 def choose_best_sole_box(detections: List[Dict[str, Any]], img_shape: Tuple[int, int, int]) -> List[float]:
-    sole_like = [d for d in detections if d["label"] in {"shoe sole", "outsole"}]
+    sole_like = [d for d in detections if d["label"] in {"shoe sole", "outsole", "running shoe sole"}]
     if not sole_like:
         raise ValueError("Could not find the sole cleanly. Retake the photo with the sole larger in frame.")
     return max(sole_like, key=lambda d: score_sole_candidate(d["xyxy"], d["conf"], img_shape))["xyxy"]
 
 
-def expand_box(box: List[float], img_shape: Tuple[int, int, int], pad_x: float = 0.10, pad_y_top: float = 0.08, pad_y_bottom: float = 0.02) -> Tuple[int, int, int, int]:
+def expand_box(
+    box: List[float],
+    img_shape: Tuple[int, int, int],
+    pad_x: float = 0.10,
+    pad_y_top: float = 0.08,
+    pad_y_bottom: float = 0.02,
+) -> Tuple[int, int, int, int]:
     h, w = img_shape[:2]
     x1, y1, x2, y2 = box
     bw = x2 - x1
@@ -680,6 +546,121 @@ def crop_from_yolo(base_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
         "crop_box": crop_box,
     }
     return enc.tobytes(), debug
+
+
+VISION_SCHEMA: Dict[str, Any] = {
+    "name": "checkmyrun_sole_analysis",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "analysis_text": {"type": "string"},
+            "left": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                    "confidence": {"type": "number"},
+                    "notes": {"type": "string"},
+                    "wear_zones": {"type": "array", "items": {"type": "string"}},
+                    "heat_anchors": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                                "intensity": {"type": "number"},
+                                "radius": {"type": "number"},
+                            },
+                            "required": ["x", "y", "intensity", "radius"],
+                        },
+                    },
+                },
+                "required": ["pronation", "confidence", "notes", "wear_zones", "heat_anchors"],
+            },
+            "right": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                    "confidence": {"type": "number"},
+                    "notes": {"type": "string"},
+                    "wear_zones": {"type": "array", "items": {"type": "string"}},
+                    "heat_anchors": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                                "intensity": {"type": "number"},
+                                "radius": {"type": "number"},
+                            },
+                            "required": ["x", "y", "intensity", "radius"],
+                        },
+                    },
+                },
+                "required": ["pronation", "confidence", "notes", "wear_zones", "heat_anchors"],
+            },
+            "overall": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                    "shoe_category": {"type": "string", "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["pronation", "shoe_category", "confidence"],
+            },
+        },
+        "required": ["analysis_text", "left", "right", "overall"],
+    },
+}
+
+
+SYSTEM_PROMPT = """
+You are analysing running shoe outsole wear from photos.
+
+You will receive cropped sole images that have already been localized, but may still contain small amounts of hand or background near the heel.
+You must identify only the outsole itself and ignore hands, wrists, sleeves, watches, floor, bags, chairs, and background clutter.
+
+Return JSON only.
+
+Rules:
+- Be object-aware.
+- Prefer useful insight over blandness.
+- Lower confidence if the evidence is weak.
+- Notes should mention asymmetry where relevant.
+- wear_zones should use labels from this set when possible:
+  lateral heel
+  central heel
+  medial heel
+  lateral forefoot
+  central forefoot
+  medial forefoot
+  lateral midfoot
+  medial midfoot
+- heat_anchors must sit only on genuine wear regions of the outsole.
+- do not place anchors on background, hand, or untouched decorative tread.
+- use 4 to 10 anchors per shoe.
+- x and y are normalized 0 to 1 coordinates within the cropped sole image.
+- intensity is 0 to 1.
+- radius is 0.03 to 0.12.
+"""
+
+USER_PROMPT = """
+Analyse the attached cropped sole photos.
+
+Return:
+1. left/right/overall pronation judgement
+2. a useful written analysis
+3. concise notes for each shoe
+4. ordered wear_zones for each shoe from strongest to weaker
+5. heat_anchors for each shoe placed over the actual visible wear
+"""
 
 
 def _extract_json_from_response(resp_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -726,7 +707,7 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
                 "strict": True,
             }
         },
-        "max_output_tokens": 1400,
+        "max_output_tokens": 1600,
     }
 
     with httpx.Client(timeout=90.0) as client:
@@ -745,26 +726,28 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
     return _extract_json_from_response(r.json())
 
 
-def normalise_zone_name(zone: str) -> str:
-    z = str(zone or "").strip().lower()
-    return z.replace("_", " ").replace("-", " ")
+def clamp01(x: Any) -> float:
+    try:
+        v = float(x)
+        return max(0.0, min(1.0, v))
+    except Exception:
+        return 0.0
 
 
-def zone_weights(zones: List[str]) -> List[Tuple[str, float]]:
-    cleaned: List[str] = []
-    seen = set()
-
-    for z in zones:
-        nz = normalise_zone_name(z)
-        if nz in ZONE_MAP and nz not in seen:
-            cleaned.append(nz)
-            seen.add(nz)
-
-    weights: List[Tuple[str, float]] = []
-    for i, z in enumerate(cleaned):
-        weight = max(0.50, 1.0 - i * 0.18)
-        weights.append((z, weight))
-    return weights
+def normalise_anchors(anchors: Any) -> List[Dict[str, float]]:
+    if not isinstance(anchors, list):
+        return []
+    out: List[Dict[str, float]] = []
+    for a in anchors:
+        if not isinstance(a, dict):
+            continue
+        out.append({
+            "x": clamp01(a.get("x", 0.5)),
+            "y": clamp01(a.get("y", 0.5)),
+            "intensity": clamp01(a.get("intensity", 0.5)),
+            "radius": max(0.03, min(0.12, float(a.get("radius", 0.06)))),
+        })
+    return out
 
 
 def build_crop_mask(base_img_bytes: bytes) -> np.ndarray:
@@ -773,42 +756,50 @@ def build_crop_mask(base_img_bytes: bytes) -> np.ndarray:
     h, w = arr.shape[:2]
 
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    _, mask = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY_INV)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    mask1 = cv2.inRange(gray, 0, 245)
+    mask2 = cv2.inRange(sat, 10, 255)
+    mask3 = cv2.inRange(val, 20, 255)
+
+    mask = cv2.bitwise_and(mask1, mask3)
+    mask = cv2.bitwise_or(mask, mask2)
 
     kernel = np.ones((9, 9), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    mask[int(h * 0.92):, :] = 0
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels > 1:
+        largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+
+    mask[int(h * 0.93):, :] = 0
     return mask
 
 
-def make_zone_heatmap(base_img_bytes: bytes, zones: List[str]) -> str:
+def make_anchor_heatmap(base_img_bytes: bytes, anchors: List[Dict[str, float]]) -> str:
     base = Image.open(io.BytesIO(base_img_bytes)).convert("RGBA")
     w, h = base.size
 
     heat = np.zeros((h, w), dtype=np.float32)
     crop_mask = build_crop_mask(base_img_bytes).astype(np.float32) / 255.0
 
-    cutoff_y = int(h * 0.90)
+    for a in anchors:
+        cx = int(a["x"] * w)
+        cy = int(a["y"] * h)
+        radius = max(12, int(a["radius"] * min(w, h)))
+        intensity = max(0.15, a["intensity"])
 
-    for zone, zone_weight in zone_weights(zones):
-        for cx_n, cy_n, r_n, intensity, weight in ZONE_MAP.get(zone, []):
-            cx = int(cx_n * w)
-            cy = int(cy_n * h)
+        y, x = np.ogrid[:h, :w]
+        dist2 = (x - cx) ** 2 + (y - cy) ** 2
+        sigma2 = max(1.0, (radius * 0.62) ** 2)
+        blob = np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
 
-            if cy > cutoff_y:
-                continue
-
-            radius = max(10, int(r_n * min(w, h)))
-
-            y, x = np.ogrid[:h, :w]
-            dist2 = (x - cx) ** 2 + (y - cy) ** 2
-
-            sigma2 = max(1.0, (radius * 0.58) ** 2)
-            blob = np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
-
-            heat += blob * intensity * zone_weight * weight
+        heat += blob * intensity
 
     heat *= crop_mask
 
@@ -829,9 +820,9 @@ def make_zone_heatmap(base_img_bytes: bytes, zones: List[str]) -> str:
 
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba[..., 0] = 255
-    rgba[..., 1] = np.clip(235 - heat * 215, 0, 255).astype(np.uint8)
-    rgba[..., 2] = np.clip(40 - heat * 40, 0, 255).astype(np.uint8)
-    rgba[..., 3] = np.clip((heat ** 1.15) * 195, 0, 195).astype(np.uint8)
+    rgba[..., 1] = np.clip(240 - heat * 220, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(60 - heat * 60, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip((heat ** 1.1) * 200, 0, 200).astype(np.uint8)
 
     overlay = Image.fromarray(rgba, "RGBA")
     combined = Image.alpha_composite(base, overlay)
@@ -856,7 +847,7 @@ def health():
     return {
         "ok": True,
         "service": "checkmyrun-api",
-        "marker": "HYBRID-YOLO-OPENAI-HEATMAP-V3",
+        "marker": "FINAL-CLEAN-HYBRID-V1",
         "model": OPENAI_MODEL,
     }
 
@@ -887,11 +878,11 @@ async def analyze(
 
         data = call_openai_vision(left_url, right_url, rear_url)
 
-        left_zones = [normalise_zone_name(z) for z in data.get("left", {}).get("wear_zones", [])]
-        right_zones = [normalise_zone_name(z) for z in data.get("right", {}).get("wear_zones", [])]
+        left_anchors = normalise_anchors(data.get("left", {}).get("heat_anchors", []))
+        right_anchors = normalise_anchors(data.get("right", {}).get("heat_anchors", []))
 
-        data["left_heatmap_data_url"] = make_zone_heatmap(left_crop_bytes, left_zones)
-        data["right_heatmap_data_url"] = make_zone_heatmap(right_crop_bytes, right_zones)
+        data["left_heatmap_data_url"] = make_anchor_heatmap(left_crop_bytes, left_anchors)
+        data["right_heatmap_data_url"] = make_anchor_heatmap(right_crop_bytes, right_anchors)
 
         data["debug"] = {
             "left_yolo": left_debug,
