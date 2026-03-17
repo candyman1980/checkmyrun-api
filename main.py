@@ -72,7 +72,6 @@ INDEX_HTML = r"""
       line-height:1.45;
       margin-bottom:18px;
     }
-    .hint ul{margin:8px 0 0 20px;padding:0}
     .uploadGrid{
       display:grid;
       grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
@@ -645,10 +644,13 @@ Rules:
   medial midfoot
 - heat_anchors must sit only on genuine wear regions of the outsole.
 - do not place anchors on background, hand, or untouched decorative tread.
-- use 4 to 10 anchors per shoe.
+- use 8 to 18 anchors per shoe.
+- include both strongest wear points and broader surrounding worn regions.
+- when a worn patch is visibly broad, use multiple neighbouring anchors rather than a single point.
+- do not be too conservative: obvious worn areas should be represented.
 - x and y are normalized 0 to 1 coordinates within the cropped sole image.
 - intensity is 0 to 1.
-- radius is 0.03 to 0.12.
+- radius is 0.03 to 0.16.
 """
 
 USER_PROMPT = """
@@ -660,6 +662,8 @@ Return:
 3. concise notes for each shoe
 4. ordered wear_zones for each shoe from strongest to weaker
 5. heat_anchors for each shoe placed over the actual visible wear
+
+Be more sensitive to visible smoothed, polished, darkened, flattened, or abraded rubber, especially when the worn area is broad rather than point-like.
 """
 
 
@@ -707,7 +711,7 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
                 "strict": True,
             }
         },
-        "max_output_tokens": 1600,
+        "max_output_tokens": 1800,
     }
 
     with httpx.Client(timeout=90.0) as client:
@@ -744,8 +748,8 @@ def normalise_anchors(anchors: Any) -> List[Dict[str, float]]:
         out.append({
             "x": clamp01(a.get("x", 0.5)),
             "y": clamp01(a.get("y", 0.5)),
-            "intensity": clamp01(a.get("intensity", 0.5)),
-            "radius": max(0.03, min(0.12, float(a.get("radius", 0.06)))),
+            "intensity": max(0.30, min(1.0, float(a.get("intensity", 0.6)))),
+            "radius": max(0.045, min(0.16, float(a.get("radius", 0.08)))),
         })
     return out
 
@@ -761,14 +765,14 @@ def build_crop_mask(base_img_bytes: bytes) -> np.ndarray:
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
 
-    mask1 = cv2.inRange(gray, 0, 245)
-    mask2 = cv2.inRange(sat, 10, 255)
-    mask3 = cv2.inRange(val, 20, 255)
+    mask1 = cv2.inRange(gray, 0, 248)
+    mask2 = cv2.inRange(sat, 8, 255)
+    mask3 = cv2.inRange(val, 15, 255)
 
     mask = cv2.bitwise_and(mask1, mask3)
     mask = cv2.bitwise_or(mask, mask2)
 
-    kernel = np.ones((9, 9), np.uint8)
+    kernel = np.ones((7, 7), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
@@ -777,7 +781,7 @@ def build_crop_mask(base_img_bytes: bytes) -> np.ndarray:
         largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
-    mask[int(h * 0.93):, :] = 0
+    mask[int(h * 0.965):, :] = 0
     return mask
 
 
@@ -787,16 +791,17 @@ def make_anchor_heatmap(base_img_bytes: bytes, anchors: List[Dict[str, float]]) 
 
     heat = np.zeros((h, w), dtype=np.float32)
     crop_mask = build_crop_mask(base_img_bytes).astype(np.float32) / 255.0
+    crop_mask = cv2.GaussianBlur(crop_mask, (0, 0), sigmaX=max(4, int(min(w, h) * 0.01)))
 
     for a in anchors:
         cx = int(a["x"] * w)
         cy = int(a["y"] * h)
-        radius = max(12, int(a["radius"] * min(w, h)))
-        intensity = max(0.15, a["intensity"])
+        radius = max(14, int(a["radius"] * min(w, h)))
+        intensity = max(0.30, a["intensity"])
 
         y, x = np.ogrid[:h, :w]
         dist2 = (x - cx) ** 2 + (y - cy) ** 2
-        sigma2 = max(1.0, (radius * 0.62) ** 2)
+        sigma2 = max(1.0, (radius * 0.82) ** 2)
         blob = np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
 
         heat += blob * intensity
@@ -809,20 +814,23 @@ def make_anchor_heatmap(base_img_bytes: bytes, anchors: List[Dict[str, float]]) 
         return f"data:image/png;base64,{base64.b64encode(out.getvalue()).decode('utf-8')}"
 
     heat = heat / float(heat.max())
+
     heat_uint = (heat * 255).astype(np.uint8)
     heat_uint = cv2.GaussianBlur(
         heat_uint,
         (0, 0),
-        sigmaX=max(10, int(min(w, h) * 0.018)),
-        sigmaY=max(10, int(min(w, h) * 0.018)),
+        sigmaX=max(16, int(min(w, h) * 0.028)),
+        sigmaY=max(16, int(min(w, h) * 0.028)),
     )
+
     heat = heat_uint.astype(np.float32) / 255.0
+    heat = np.clip(heat ** 0.78, 0.0, 1.0)
 
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba[..., 0] = 255
-    rgba[..., 1] = np.clip(240 - heat * 220, 0, 255).astype(np.uint8)
-    rgba[..., 2] = np.clip(60 - heat * 60, 0, 255).astype(np.uint8)
-    rgba[..., 3] = np.clip((heat ** 1.1) * 200, 0, 200).astype(np.uint8)
+    rgba[..., 1] = np.clip(245 - heat * 235, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(70 - heat * 70, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip((heat ** 0.95) * 220, 0, 220).astype(np.uint8)
 
     overlay = Image.fromarray(rgba, "RGBA")
     combined = Image.alpha_composite(base, overlay)
@@ -847,7 +855,7 @@ def health():
     return {
         "ok": True,
         "service": "checkmyrun-api",
-        "marker": "FINAL-CLEAN-HYBRID-V1",
+        "marker": "FINAL-CLEAN-HYBRID-V2",
         "model": OPENAI_MODEL,
     }
 
