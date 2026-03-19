@@ -878,28 +878,3 @@ async def analyze(
 
     except Exception as e:
         return JSONResponse(content=_default_payload(str(e)), status_code=500)
-
-## `requirements.txt`
-
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-multipart==0.0.9
-numpy==1.26.4
-opencv-python-headless==4.10.0.84
-Pillow==10.4.0
-httpx==0.27.2
-ultralytics==8.3.0
-
-## Build command
-
-pip install -r requirements.txt
-
-
-## Start command
-
-uvicorn main:app --host 0.0.0.0 --port 10000
-
-
-After deploy, `/health` should show:
-
-"marker":"CHATGPT-GRID-HEATMAP-V1"
