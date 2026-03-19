@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,8 +23,8 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
-GRID_W = 12
-GRID_H = 20
+GRID_W = 14
+GRID_H = 24
 
 app = FastAPI(title="CheckMyRun")
 
@@ -373,7 +374,7 @@ form.addEventListener("submit", async (e) => {
     try {
       data = JSON.parse(rawText);
     } catch {
-      throw new Error("Server did not return valid JSON. Check Raw JSON below.");
+      throw new Error(rawText || "Server did not return valid JSON.");
     }
 
     if (!res.ok) {
@@ -555,13 +556,13 @@ def make_heat_grid_schema() -> Dict[str, Any]:
         "type": "array",
         "minItems": GRID_W,
         "maxItems": GRID_W,
-        "items": {"type": "number"}
+        "items": {"type": "number"},
     }
     grid_schema = {
         "type": "array",
         "minItems": GRID_H,
         "maxItems": GRID_H,
-        "items": row_schema
+        "items": row_schema,
     }
 
     return {
@@ -575,7 +576,10 @@ def make_heat_grid_schema() -> Dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "pronation": {
+                            "type": "string",
+                            "enum": ["overpronation", "underpronation", "neutral", "unclear"],
+                        },
                         "confidence": {"type": "number"},
                         "notes": {"type": "string"},
                         "wear_zones": {"type": "array", "items": {"type": "string"}},
@@ -587,7 +591,10 @@ def make_heat_grid_schema() -> Dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "pronation": {
+                            "type": "string",
+                            "enum": ["overpronation", "underpronation", "neutral", "unclear"],
+                        },
                         "confidence": {"type": "number"},
                         "notes": {"type": "string"},
                         "wear_zones": {"type": "array", "items": {"type": "string"}},
@@ -599,8 +606,14 @@ def make_heat_grid_schema() -> Dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
-                        "shoe_category": {"type": "string", "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]},
+                        "pronation": {
+                            "type": "string",
+                            "enum": ["overpronation", "underpronation", "neutral", "unclear"],
+                        },
+                        "shoe_category": {
+                            "type": "string",
+                            "enum": ["stability", "neutral", "cushioned-neutral", "unclear"],
+                        },
                         "confidence": {"type": "number"},
                     },
                     "required": ["pronation", "shoe_category", "confidence"],
@@ -638,8 +651,10 @@ Rules:
 - For each shoe, return a heat_grid of exactly {GRID_H} rows by {GRID_W} columns.
 - Each cell is a number from 0.0 to 1.0 representing how worn that region looks.
 - Higher values should cover visibly broad smoothed, polished, darkened, flattened, or abraded rubber.
-- Do not be too conservative.
+- Be assertive rather than timid when wear is clearly visible.
 - Broad obvious worn areas should occupy multiple neighbouring cells.
+- Strong wear should use many 0.75 to 1.0 cells, not just mild mid-range values.
+- Distinguish true hotspots from surrounding support regions.
 - Do not light up background, hand, or untouched decorative tread.
 - The grid is top-to-bottom and left-to-right over the cropped image.
 """
@@ -654,23 +669,39 @@ Return:
 4. ordered wear_zones for each shoe from strongest to weaker
 5. a dense {GRID_H}x{GRID_W} wear heat_grid for each shoe
 
-Be more sensitive to broad visible wear, not just peak spots.
+Be more sensitive to broad visible wear, not just peak spots. Use higher values for clearly worn patches so the final heatmap shows convincing hotspots instead of only lukewarm regions.
 """
 
 
 def _extract_json_from_response(resp_json: Dict[str, Any]) -> Dict[str, Any]:
+    def try_parse(text: str):
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
     output_text = resp_json.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return json.loads(output_text)
+    if isinstance(output_text, str):
+        parsed = try_parse(output_text)
+        if parsed is not None:
+            return parsed
 
     for item in resp_json.get("output", []):
         for content in item.get("content", []):
-            if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
-                txt = content["text"].strip()
-                if txt:
-                    return json.loads(txt)
+            if content.get("type") in {"output_text", "text"}:
+                txt = content.get("text", "")
+                if isinstance(txt, str):
+                    parsed = try_parse(txt)
+                    if parsed is not None:
+                        return parsed
 
-    raise ValueError("Could not extract structured JSON from model response.")
+                    match = re.search(r"\{[\s\S]*\}", txt)
+                    if match:
+                        parsed = try_parse(match.group(0))
+                        if parsed is not None:
+                            return parsed
+
+    raise ValueError(f"Could not parse JSON from model response: {resp_json}")
 
 
 def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -> Dict[str, Any]:
@@ -738,7 +769,9 @@ def normalise_grid(grid: Any) -> List[List[float]]:
         if not isinstance(row, list) or len(row) != GRID_W:
             out.append([0.0 for _ in range(GRID_W)])
             continue
-        out.append([clamp01(v) for v in row])
+        cleaned = [clamp01(v) for v in row]
+        cleaned = [0.0 if v < 0.08 else min(1.0, (v ** 0.72) * 1.22) for v in cleaned]
+        out.append(cleaned)
     return out
 
 
@@ -778,20 +811,23 @@ def make_grid_heatmap(base_img_bytes: bytes, grid: List[List[float]]) -> str:
     w, h = base.size
 
     crop_mask = build_crop_mask(base_img_bytes).astype(np.float32) / 255.0
-    crop_mask = cv2.GaussianBlur(crop_mask, (0, 0), sigmaX=max(4, int(min(w, h) * 0.01)))
+    crop_mask = cv2.GaussianBlur(crop_mask, (0, 0), sigmaX=max(3, int(min(w, h) * 0.006)))
 
     grid_arr = np.array(grid, dtype=np.float32)
     grid_arr = np.clip(grid_arr, 0.0, 1.0)
-    grid_arr = np.clip(grid_arr ** 0.78, 0.0, 1.0)
+
+    grid_arr = np.where(grid_arr < 0.10, 0.0, grid_arr)
+    grid_arr = np.clip((grid_arr ** 0.62) * 1.28, 0.0, 1.0)
 
     heat = cv2.resize(grid_arr, (w, h), interpolation=cv2.INTER_CUBIC)
     heat = cv2.GaussianBlur(
         heat,
         (0, 0),
-        sigmaX=max(18, int(min(w, h) * 0.030)),
-        sigmaY=max(18, int(min(w, h) * 0.030)),
+        sigmaX=max(10, int(min(w, h) * 0.018)),
+        sigmaY=max(10, int(min(w, h) * 0.018)),
     )
 
+    heat = np.clip((heat ** 0.82) * 1.18, 0.0, 1.0)
     heat *= crop_mask
     heat = np.clip(heat, 0.0, 1.0)
 
@@ -804,9 +840,9 @@ def make_grid_heatmap(base_img_bytes: bytes, grid: List[List[float]]) -> str:
 
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba[..., 0] = 255
-    rgba[..., 1] = np.clip(245 - heat * 235, 0, 255).astype(np.uint8)
-    rgba[..., 2] = np.clip(70 - heat * 70, 0, 255).astype(np.uint8)
-    rgba[..., 3] = np.clip((heat ** 0.95) * 220, 0, 220).astype(np.uint8)
+    rgba[..., 1] = np.clip(250 - heat * 250, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(85 - heat * 85, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip((heat ** 0.82) * 245, 0, 245).astype(np.uint8)
 
     overlay = Image.fromarray(rgba, "RGBA")
     combined = Image.alpha_composite(base, overlay)
@@ -831,7 +867,7 @@ def health():
     return {
         "ok": True,
         "service": "checkmyrun-api",
-        "marker": "CHATGPT-GRID-HEATMAP-V1",
+        "marker": "CHATGPT-GRID-HEATMAP-V2",
         "model": OPENAI_MODEL,
     }
 
