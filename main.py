@@ -23,8 +23,9 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
-GRID_W = 14
-GRID_H = 24
+# Reduced grid so the model can reliably complete JSON
+GRID_W = 10
+GRID_H = 16
 
 app = FastAPI(title="CheckMyRun")
 
@@ -733,10 +734,10 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
                 "strict": True,
             }
         },
-        "max_output_tokens": 2200,
+        "max_output_tokens": 4000,
     }
 
-    with httpx.Client(timeout=90.0) as client:
+    with httpx.Client(timeout=120.0) as client:
         r = client.post(
             "https://api.openai.com/v1/responses",
             headers={
@@ -749,7 +750,13 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
     if r.status_code != 200:
         raise ValueError(f"OpenAI error {r.status_code}: {r.text}")
 
-    return _extract_json_from_response(r.json())
+    raw = r.json()
+
+    if raw.get("status") == "incomplete":
+        reason = raw.get("incomplete_details", {}).get("reason", "unknown")
+        raise ValueError(f"Model response incomplete: {reason}")
+
+    return _extract_json_from_response(raw)
 
 
 def clamp01(x: Any) -> float:
@@ -867,7 +874,7 @@ def health():
     return {
         "ok": True,
         "service": "checkmyrun-api",
-        "marker": "CHATGPT-GRID-HEATMAP-V2",
+        "marker": "CHATGPT-GRID-HEATMAP-V3",
         "model": OPENAI_MODEL,
     }
 
