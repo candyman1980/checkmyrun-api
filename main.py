@@ -5,7 +5,6 @@ import base64
 import io
 import json
 import os
-import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,8 +22,8 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
-GRID_W = 10
-GRID_H = 16
+GRID_W = 14
+GRID_H = 24
 
 app = FastAPI(title="CheckMyRun")
 
@@ -374,7 +373,7 @@ form.addEventListener("submit", async (e) => {
     try {
       data = JSON.parse(rawText);
     } catch {
-      throw new Error(rawText || "Server did not return valid JSON.");
+      throw new Error("Server did not return valid JSON. Check Raw JSON below.");
     }
 
     if (!res.ok) {
@@ -556,13 +555,13 @@ def make_heat_grid_schema() -> Dict[str, Any]:
         "type": "array",
         "minItems": GRID_W,
         "maxItems": GRID_W,
-        "items": {"type": "number"},
+        "items": {"type": "number"}
     }
     grid_schema = {
         "type": "array",
         "minItems": GRID_H,
         "maxItems": GRID_H,
-        "items": row_schema,
+        "items": row_schema
     }
 
     return {
@@ -662,34 +661,18 @@ Be more sensitive to broad visible wear, not just peak spots. Use higher values 
 
 
 def _extract_json_from_response(resp_json: Dict[str, Any]) -> Dict[str, Any]:
-    def try_parse(text: str):
-        try:
-            return json.loads(text)
-        except Exception:
-            return None
-
     output_text = resp_json.get("output_text")
-    if isinstance(output_text, str):
-        parsed = try_parse(output_text)
-        if parsed is not None:
-            return parsed
+    if isinstance(output_text, str) and output_text.strip():
+        return json.loads(output_text)
 
     for item in resp_json.get("output", []):
         for content in item.get("content", []):
-            if content.get("type") in {"output_text", "text"}:
-                txt = content.get("text", "")
-                if isinstance(txt, str):
-                    parsed = try_parse(txt)
-                    if parsed is not None:
-                        return parsed
+            if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
+                txt = content["text"].strip()
+                if txt:
+                    return json.loads(txt)
 
-                    match = re.search(r"\{[\s\S]*\}", txt)
-                    if match:
-                        parsed = try_parse(match.group(0))
-                        if parsed is not None:
-                            return parsed
-
-    raise ValueError(f"Could not parse JSON from model response: {resp_json}")
+    raise ValueError("Could not extract structured JSON from model response.")
 
 
 def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -> Dict[str, Any]:
@@ -721,10 +704,10 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
                 "strict": True,
             }
         },
-        "max_output_tokens": 4000,
+        "max_output_tokens": 2200,
     }
 
-    with httpx.Client(timeout=120.0) as client:
+    with httpx.Client(timeout=90.0) as client:
         r = client.post(
             "https://api.openai.com/v1/responses",
             headers={
@@ -737,13 +720,7 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
     if r.status_code != 200:
         raise ValueError(f"OpenAI error {r.status_code}: {r.text}")
 
-    raw = r.json()
-
-    if raw.get("status") == "incomplete":
-        reason = raw.get("incomplete_details", {}).get("reason", "unknown")
-        raise ValueError(f"Model response incomplete: {reason}")
-
-    return _extract_json_from_response(raw)
+    return _extract_json_from_response(r.json())
 
 
 def clamp01(x: Any) -> float:
@@ -764,6 +741,7 @@ def normalise_grid(grid: Any) -> List[List[float]]:
             out.append([0.0 for _ in range(GRID_W)])
             continue
         cleaned = [clamp01(v) for v in row]
+        # Lift moderate values so visible wear does not disappear into a vague wash
         cleaned = [0.0 if v < 0.08 else min(1.0, (v ** 0.72) * 1.22) for v in cleaned]
         out.append(cleaned)
     return out
@@ -810,6 +788,7 @@ def make_grid_heatmap(base_img_bytes: bytes, grid: List[List[float]]) -> str:
     grid_arr = np.array(grid, dtype=np.float32)
     grid_arr = np.clip(grid_arr, 0.0, 1.0)
 
+    # Increase contrast between weak and strong wear
     grid_arr = np.where(grid_arr < 0.10, 0.0, grid_arr)
     grid_arr = np.clip((grid_arr ** 0.62) * 1.28, 0.0, 1.0)
 
@@ -821,7 +800,9 @@ def make_grid_heatmap(base_img_bytes: bytes, grid: List[List[float]]) -> str:
         sigmaY=max(10, int(min(w, h) * 0.018)),
     )
 
+    # Re-sharpen hotspot peaks after smoothing so they don't look lukewarm
     heat = np.clip((heat ** 0.82) * 1.18, 0.0, 1.0)
+
     heat *= crop_mask
     heat = np.clip(heat, 0.0, 1.0)
 
@@ -861,7 +842,7 @@ def health():
     return {
         "ok": True,
         "service": "checkmyrun-api",
-        "marker": "CHATGPT-GRID-HEATMAP-V3",
+        "marker": "CHATGPT-GRID-HEATMAP-V1",
         "model": OPENAI_MODEL,
     }
 
