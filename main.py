@@ -23,7 +23,6 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
-# Reduced grid so the model can reliably complete JSON
 GRID_W = 10
 GRID_H = 16
 
@@ -577,10 +576,7 @@ def make_heat_grid_schema() -> Dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "pronation": {
-                            "type": "string",
-                            "enum": ["overpronation", "underpronation", "neutral", "unclear"],
-                        },
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
                         "confidence": {"type": "number"},
                         "notes": {"type": "string"},
                         "wear_zones": {"type": "array", "items": {"type": "string"}},
@@ -592,10 +588,7 @@ def make_heat_grid_schema() -> Dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "pronation": {
-                            "type": "string",
-                            "enum": ["overpronation", "underpronation", "neutral", "unclear"],
-                        },
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
                         "confidence": {"type": "number"},
                         "notes": {"type": "string"},
                         "wear_zones": {"type": "array", "items": {"type": "string"}},
@@ -607,14 +600,8 @@ def make_heat_grid_schema() -> Dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "pronation": {
-                            "type": "string",
-                            "enum": ["overpronation", "underpronation", "neutral", "unclear"],
-                        },
-                        "shoe_category": {
-                            "type": "string",
-                            "enum": ["stability", "neutral", "cushioned-neutral", "unclear"],
-                        },
+                        "pronation": {"type": "string", "enum": ["overpronation", "underpronation", "neutral", "unclear"]},
+                        "shoe_category": {"type": "string", "enum": ["stability", "neutral", "cushioned-neutral", "unclear"]},
                         "confidence": {"type": "number"},
                     },
                     "required": ["pronation", "shoe_category", "confidence"],
