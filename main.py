@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,8 +23,9 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
-GRID_W = 14
-GRID_H = 24
+# Keep this moderate so the model actually completes the JSON reliably.
+GRID_W = 10
+GRID_H = 16
 
 app = FastAPI(title="CheckMyRun")
 
@@ -373,7 +375,7 @@ form.addEventListener("submit", async (e) => {
     try {
       data = JSON.parse(rawText);
     } catch {
-      throw new Error("Server did not return valid JSON. Check Raw JSON below.");
+      throw new Error(rawText || "Server did not return valid JSON.");
     }
 
     if (!res.ok) {
@@ -555,13 +557,13 @@ def make_heat_grid_schema() -> Dict[str, Any]:
         "type": "array",
         "minItems": GRID_W,
         "maxItems": GRID_W,
-        "items": {"type": "number"}
+        "items": {"type": "number"},
     }
     grid_schema = {
         "type": "array",
         "minItems": GRID_H,
         "maxItems": GRID_H,
-        "items": row_schema
+        "items": row_schema,
     }
 
     return {
@@ -644,6 +646,10 @@ Rules:
 - Distinguish true hotspots from surrounding support regions.
 - Do not light up background, hand, or untouched decorative tread.
 - The grid is top-to-bottom and left-to-right over the cropped image.
+- Use stronger heat values for clearly visible wear.
+- If a broad worn patch is obvious, assign many neighbouring cells values between 0.7 and 1.0.
+- Do not return timid mid-range values when wear is visually obvious.
+- Create distinct hotspots, not flat weak distributions.
 """
 
 USER_PROMPT = f"""
@@ -661,18 +667,34 @@ Be more sensitive to broad visible wear, not just peak spots. Use higher values 
 
 
 def _extract_json_from_response(resp_json: Dict[str, Any]) -> Dict[str, Any]:
+    def try_parse(text: str):
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
     output_text = resp_json.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return json.loads(output_text)
+    if isinstance(output_text, str):
+        parsed = try_parse(output_text)
+        if parsed is not None:
+            return parsed
 
     for item in resp_json.get("output", []):
         for content in item.get("content", []):
-            if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
-                txt = content["text"].strip()
-                if txt:
-                    return json.loads(txt)
+            if content.get("type") in {"output_text", "text"}:
+                txt = content.get("text", "")
+                if isinstance(txt, str):
+                    parsed = try_parse(txt)
+                    if parsed is not None:
+                        return parsed
 
-    raise ValueError("Could not extract structured JSON from model response.")
+                    match = re.search(r"\{[\s\S]*\}", txt)
+                    if match:
+                        parsed = try_parse(match.group(0))
+                        if parsed is not None:
+                            return parsed
+
+    raise ValueError(f"Could not parse JSON from model response: {resp_json}")
 
 
 def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -> Dict[str, Any]:
@@ -704,10 +726,10 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
                 "strict": True,
             }
         },
-        "max_output_tokens": 2200,
+        "max_output_tokens": 4000,
     }
 
-    with httpx.Client(timeout=90.0) as client:
+    with httpx.Client(timeout=120.0) as client:
         r = client.post(
             "https://api.openai.com/v1/responses",
             headers={
@@ -720,7 +742,13 @@ def call_openai_vision(left_url: str, right_url: str, rear_url: Optional[str]) -
     if r.status_code != 200:
         raise ValueError(f"OpenAI error {r.status_code}: {r.text}")
 
-    return _extract_json_from_response(r.json())
+    raw = r.json()
+
+    if raw.get("status") == "incomplete":
+        reason = raw.get("incomplete_details", {}).get("reason", "unknown")
+        raise ValueError(f"Model response incomplete: {reason}")
+
+    return _extract_json_from_response(raw)
 
 
 def clamp01(x: Any) -> float:
@@ -741,8 +769,7 @@ def normalise_grid(grid: Any) -> List[List[float]]:
             out.append([0.0 for _ in range(GRID_W)])
             continue
         cleaned = [clamp01(v) for v in row]
-        # Lift moderate values so visible wear does not disappear into a vague wash
-        cleaned = [0.0 if v < 0.08 else min(1.0, (v ** 0.72) * 1.22) for v in cleaned]
+        cleaned = [0.0 if v < 0.05 else min(1.0, (v ** 0.68) * 1.28) for v in cleaned]
         out.append(cleaned)
     return out
 
@@ -752,30 +779,38 @@ def build_crop_mask(base_img_bytes: bytes) -> np.ndarray:
     arr = np.array(base)
     h, w = arr.shape[:2]
 
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
 
-    mask1 = cv2.inRange(gray, 0, 248)
-    mask2 = cv2.inRange(sat, 8, 255)
-    mask3 = cv2.inRange(val, 15, 255)
-
-    mask = cv2.bitwise_and(mask1, mask3)
-    mask = cv2.bitwise_or(mask, mask2)
+    background_like = ((val > 242) & (sat < 20)).astype(np.uint8) * 255
+    foreground = 255 - background_like
 
     kernel = np.ones((7, 7), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel)
+    foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, kernel)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(foreground, connectivity=8)
     if num_labels > 1:
         largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+        candidate = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+        coverage = float(candidate.mean()) / 255.0
+        if 0.08 <= coverage <= 0.95:
+            foreground = candidate
 
-    mask[int(h * 0.975):, :] = 0
-    return mask
+    coverage = float(foreground.mean()) / 255.0
+    if coverage < 0.08:
+        foreground = np.full((h, w), 255, dtype=np.uint8)
+        border_y = max(6, int(h * 0.02))
+        border_x = max(6, int(w * 0.02))
+        foreground[:border_y, :] = 0
+        foreground[-border_y:, :] = 0
+        foreground[:, :border_x] = 0
+        foreground[:, -border_x:] = 0
+
+    return foreground
 
 
 def make_grid_heatmap(base_img_bytes: bytes, grid: List[List[float]]) -> str:
@@ -783,41 +818,46 @@ def make_grid_heatmap(base_img_bytes: bytes, grid: List[List[float]]) -> str:
     w, h = base.size
 
     crop_mask = build_crop_mask(base_img_bytes).astype(np.float32) / 255.0
-    crop_mask = cv2.GaussianBlur(crop_mask, (0, 0), sigmaX=max(3, int(min(w, h) * 0.006)))
+    crop_mask = cv2.GaussianBlur(crop_mask, (0, 0), sigmaX=max(2, int(min(w, h) * 0.004)))
+
+    if float(crop_mask.max()) < 0.05:
+        crop_mask = np.ones((h, w), dtype=np.float32)
 
     grid_arr = np.array(grid, dtype=np.float32)
     grid_arr = np.clip(grid_arr, 0.0, 1.0)
 
-    # Increase contrast between weak and strong wear
-    grid_arr = np.where(grid_arr < 0.10, 0.0, grid_arr)
-    grid_arr = np.clip((grid_arr ** 0.62) * 1.28, 0.0, 1.0)
+    grid_arr = np.where(grid_arr < 0.05, 0.0, grid_arr)
+    grid_arr = np.clip((grid_arr ** 0.50) * 1.55, 0.0, 1.0)
 
     heat = cv2.resize(grid_arr, (w, h), interpolation=cv2.INTER_CUBIC)
     heat = cv2.GaussianBlur(
         heat,
         (0, 0),
-        sigmaX=max(10, int(min(w, h) * 0.018)),
-        sigmaY=max(10, int(min(w, h) * 0.018)),
+        sigmaX=max(8, int(min(w, h) * 0.014)),
+        sigmaY=max(8, int(min(w, h) * 0.014)),
     )
 
-    # Re-sharpen hotspot peaks after smoothing so they don't look lukewarm
-    heat = np.clip((heat ** 0.82) * 1.18, 0.0, 1.0)
-
+    heat = np.clip((heat ** 0.65) * 1.35, 0.0, 1.0)
     heat *= crop_mask
     heat = np.clip(heat, 0.0, 1.0)
 
     if float(heat.max()) <= 1e-6:
-        out = io.BytesIO()
-        base.save(out, format="PNG")
-        return f"data:image/png;base64,{base64.b64encode(out.getvalue()).decode('utf-8')}"
-
-    heat = heat / float(heat.max())
+        heat = cv2.resize(np.clip(np.array(grid, dtype=np.float32), 0.0, 1.0), (w, h), interpolation=cv2.INTER_CUBIC)
+        heat = np.clip((heat ** 0.55) * 1.45, 0.0, 1.0)
+        if float(heat.max()) > 1e-6:
+            heat = heat / float(heat.max())
+        else:
+            out = io.BytesIO()
+            base.save(out, format="PNG")
+            return f"data:image/png;base64,{base64.b64encode(out.getvalue()).decode('utf-8')}"
+    else:
+        heat = heat / float(heat.max())
 
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba[..., 0] = 255
-    rgba[..., 1] = np.clip(250 - heat * 250, 0, 255).astype(np.uint8)
-    rgba[..., 2] = np.clip(85 - heat * 85, 0, 255).astype(np.uint8)
-    rgba[..., 3] = np.clip((heat ** 0.82) * 245, 0, 245).astype(np.uint8)
+    rgba[..., 1] = np.clip(245 - heat * 245, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(60 - heat * 60, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip((heat ** 0.70) * 255, 0, 255).astype(np.uint8)
 
     overlay = Image.fromarray(rgba, "RGBA")
     combined = Image.alpha_composite(base, overlay)
@@ -842,7 +882,7 @@ def health():
     return {
         "ok": True,
         "service": "checkmyrun-api",
-        "marker": "CHATGPT-GRID-HEATMAP-V1",
+        "marker": "CHATGPT-GRID-HEATMAP-V4",
         "model": OPENAI_MODEL,
     }
 
