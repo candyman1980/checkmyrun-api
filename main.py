@@ -156,7 +156,7 @@ def assess_zones(left_url: str, right_url: str) -> Dict:
                 "schema": ANALYSIS_SCHEMA,
             }
         },
-        "max_output_tokens": 1200,
+        "max_output_tokens": 3000,
     }
     response = httpx.post(
         "https://api.openai.com/v1/responses",
