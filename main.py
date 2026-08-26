@@ -18,7 +18,7 @@ from ultralytics import YOLOWorld
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 MAX_IMAGE_SIDE = 1800
 
 app = FastAPI(title="CheckMyRun")
