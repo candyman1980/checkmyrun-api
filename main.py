@@ -54,22 +54,78 @@ def decode_image(base_bytes: bytes) -> np.ndarray:
     return img
 
 
-def crop_from_yolo(base_bytes: bytes):
-    img = decode_image(base_bytes)
-    model = get_yolo_world()
-    results = model.predict(img, imgsz=640, conf=0.2, verbose=False)[0]
-
-    if results.boxes is None:
-        raise ValueError("No sole detected")
-
-    boxes = results.boxes.xyxy.cpu().numpy()
-    best = boxes[0]
-    x1, y1, x2, y2 = map(int, best)
-
+def _encode_crop(img: np.ndarray, box: Tuple[int, int, int, int]):
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = box
+    pad_x = max(8, int((x2 - x1) * 0.04))
+    pad_y = max(8, int((y2 - y1) * 0.04))
+    x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+    x2, y2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
     crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
+        raise ValueError("The detected sole area was empty")
     _, enc = cv2.imencode(".png", crop)
-
     return enc.tobytes()
+
+
+def _background_crop(img: np.ndarray):
+    """Find the main object by comparing it with the image-border colour."""
+    h, w = img.shape[:2]
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    border = np.concatenate((lab[0], lab[-1], lab[:, 0], lab[:, -1]), axis=0)
+    background = np.median(border, axis=0)
+    distance = np.linalg.norm(lab - background, axis=2)
+    border_distance = np.concatenate((distance[0], distance[-1], distance[:, 0], distance[:, -1]))
+    threshold = max(16.0, float(np.percentile(border_distance, 90)) + 8.0)
+    mask = (distance > threshold).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = [c for c in contours if cv2.contourArea(c) >= h * w * 0.08]
+    if not candidates:
+        return None
+    x, y, cw, ch = cv2.boundingRect(max(candidates, key=cv2.contourArea))
+    if cw < w * 0.18 or ch < h * 0.30:
+        return None
+    return (x, y, x + cw, y + ch)
+
+
+def crop_sole(base_bytes: bytes):
+    img = decode_image(base_bytes)
+    h, w = img.shape[:2]
+    if min(h, w) < 400:
+        raise ValueError("Photo resolution is too low; use a photo at least 400 pixels wide and high")
+
+    try:
+        model = get_yolo_world()
+        results = model.predict(img, imgsz=960, conf=0.08, verbose=False)[0]
+        if results.boxes is not None and len(results.boxes) > 0:
+            boxes = results.boxes.xyxy.cpu().numpy()
+            confidences = results.boxes.conf.cpu().numpy()
+            best_index = int(np.argmax(confidences))
+            box = tuple(map(int, boxes[best_index]))
+            return _encode_crop(img, box), {
+                "crop_method": "object_detector",
+                "detection_confidence": round(float(confidences[best_index]), 3),
+            }
+    except Exception:
+        # A detector/model failure must not discard an otherwise usable photo.
+        pass
+
+    fallback_box = _background_crop(img)
+    if fallback_box is not None:
+        return _encode_crop(img, fallback_box), {
+            "crop_method": "background_segmentation",
+            "detection_confidence": None,
+        }
+
+    # The upload guide already asks users to fill the frame with one sole. Using
+    # the full image is safer than crashing or inventing a crop.
+    return _encode_crop(img, (0, 0, w, h)), {
+        "crop_method": "full_image_fallback",
+        "detection_confidence": None,
+    }
 
 
 # ===============================
@@ -191,8 +247,8 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
         left_bytes = await left.read()
         right_bytes = await right.read()
 
-        left_crop = crop_from_yolo(left_bytes)
-        right_crop = crop_from_yolo(right_bytes)
+        left_crop, left_detection = crop_sole(left_bytes)
+        right_crop, right_detection = crop_sole(right_bytes)
 
         left_cv = compute_cv_abrasion_map(left_crop)
         right_cv = compute_cv_abrasion_map(right_crop)
@@ -206,6 +262,10 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
             "debug": {
                 "left_grid": left_grid,
                 "right_grid": right_grid,
+            },
+            "quality": {
+                "left": left_detection,
+                "right": right_detection,
             },
         }
 
