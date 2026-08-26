@@ -1,33 +1,27 @@
-import cv2
-cv2.setNumThreads(1)
-
 import base64
 import io
 import json
 import os
-import re
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Tuple
+
+import cv2
+cv2.setNumThreads(1)
 
 import httpx
 import numpy as np
-from PIL import Image
-
+from PIL import Image, ImageOps
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-
+from fastapi.responses import JSONResponse
 from ultralytics import YOLOWorld
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
-
-GRID_W = 10
-GRID_H = 16
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+MAX_IMAGE_SIDE = 1800
 
 app = FastAPI(title="CheckMyRun")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,41 +29,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===============================
-# ======= YOLO CROPPING =========
-# ===============================
 
 @lru_cache(maxsize=1)
 def get_yolo_world():
     model = YOLOWorld("yolov8s-world.pt")
-    model.set_classes(["shoe sole", "outsole", "running shoe sole"])
+    model.set_classes(["shoe outsole", "shoe sole", "running shoe outsole", "trainer sole"])
     return model
 
 
-def decode_image(base_bytes: bytes) -> np.ndarray:
-    arr = np.frombuffer(base_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Could not decode image")
-    return img
+def prepare_image(raw: bytes) -> Tuple[bytes, np.ndarray]:
+    try:
+        pil = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    except Exception as exc:
+        raise ValueError("The uploaded file is not a readable photograph") from exc
+    if min(pil.size) < 400:
+        raise ValueError("Photo resolution is too low; use an image at least 400 pixels wide and high")
+    scale = min(1.0, MAX_IMAGE_SIDE / max(pil.size))
+    if scale < 1:
+        pil = pil.resize((round(pil.width * scale), round(pil.height * scale)), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    pil.save(buffer, format="JPEG", quality=92, optimize=True)
+    bgr = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+    return buffer.getvalue(), bgr
 
 
-def _encode_crop(img: np.ndarray, box: Tuple[int, int, int, int]):
-    h, w = img.shape[:2]
-    x1, y1, x2, y2 = box
-    pad_x = max(8, int((x2 - x1) * 0.04))
-    pad_y = max(8, int((y2 - y1) * 0.04))
-    x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
-    x2, y2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
-    crop = img[y1:y2, x1:x2]
-    if crop.size == 0:
-        raise ValueError("The detected sole area was empty")
-    _, enc = cv2.imencode(".png", crop)
-    return enc.tobytes()
+def image_data_url(jpeg: bytes) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()
 
 
-def _background_crop(img: np.ndarray):
-    """Find the main object by comparing it with the image-border colour."""
+def background_box(img: np.ndarray):
     h, w = img.shape[:2]
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     border = np.concatenate((lab[0], lab[-1], lab[:, 0], lab[:, -1]), axis=0)
@@ -91,183 +79,193 @@ def _background_crop(img: np.ndarray):
     return (x, y, x + cw, y + ch)
 
 
-def crop_sole(base_bytes: bytes):
-    img = decode_image(base_bytes)
+def locate_sole(img: np.ndarray):
     h, w = img.shape[:2]
-    if min(h, w) < 400:
-        raise ValueError("Photo resolution is too low; use a photo at least 400 pixels wide and high")
-
     try:
-        model = get_yolo_world()
-        results = model.predict(img, imgsz=960, conf=0.08, verbose=False)[0]
-        if results.boxes is not None and len(results.boxes) > 0:
-            boxes = results.boxes.xyxy.cpu().numpy()
-            confidences = results.boxes.conf.cpu().numpy()
-            best_index = int(np.argmax(confidences))
-            box = tuple(map(int, boxes[best_index]))
-            return _encode_crop(img, box), {
-                "crop_method": "object_detector",
-                "detection_confidence": round(float(confidences[best_index]), 3),
-            }
+        result = get_yolo_world().predict(img, imgsz=960, conf=0.06, verbose=False)[0]
+        if result.boxes is not None and len(result.boxes) > 0:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            confidence = result.boxes.conf.cpu().numpy()
+            index = int(np.argmax(confidence))
+            x1, y1, x2, y2 = map(int, boxes[index])
+            return (x1, y1, x2, y2), "object_detector", round(float(confidence[index]), 3)
     except Exception:
-        # A detector/model failure must not discard an otherwise usable photo.
         pass
-
-    fallback_box = _background_crop(img)
-    if fallback_box is not None:
-        return _encode_crop(img, fallback_box), {
-            "crop_method": "background_segmentation",
-            "detection_confidence": None,
-        }
-
-    # The upload guide already asks users to fill the frame with one sole. Using
-    # the full image is safer than crashing or inventing a crop.
-    return _encode_crop(img, (0, 0, w, h)), {
-        "crop_method": "full_image_fallback",
-        "detection_confidence": None,
-    }
+    fallback = background_box(img)
+    if fallback:
+        return fallback, "background_segmentation", None
+    return (0, 0, w, h), "full_image_fallback", None
 
 
-# ===============================
-# ======= CV WEAR MAP ===========
-# ===============================
+ZONE_KEYS = [
+    "heel_lateral", "heel_central", "heel_medial",
+    "midfoot_lateral", "midfoot_medial",
+    "forefoot_lateral", "forefoot_central", "forefoot_medial", "toe",
+]
 
-def compute_cv_abrasion_map(img_bytes: bytes):
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    arr = np.array(img).astype(np.float32) / 255.0
+ANALYSIS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["usable", "confidence", "left", "right", "comparison", "limitations"],
+    "properties": {
+        "usable": {"type": "boolean"},
+        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "left": {
+            "type": "object", "additionalProperties": False,
+            "required": ZONE_KEYS,
+            "properties": {key: {"type": "integer", "minimum": 0, "maximum": 3} for key in ZONE_KEYS},
+        },
+        "right": {
+            "type": "object", "additionalProperties": False,
+            "required": ZONE_KEYS,
+            "properties": {key: {"type": "integer", "minimum": 0, "maximum": 3} for key in ZONE_KEYS},
+        },
+        "comparison": {"type": "string"},
+        "limitations": {"type": "string"},
+    },
+}
 
-    gray = cv2.cvtColor((arr * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY) / 255.0
+ASSESSMENT_PROMPT = """You are assessing visible running-shoe outsole wear from two photographs.
+Image 1 is the LEFT shoe; Image 2 is the RIGHT shoe. The user was told to point both toes away from the camera, with heels nearest the camera.
 
-    lap = cv2.Laplacian((gray * 255).astype(np.uint8), cv2.CV_32F)
-    texture = np.abs(lap)
-    texture = texture / (texture.max() + 1e-6)
+Score only visually supported loss of tread depth, rounded tread edges, smoothing/polishing, abrasion, or clearly asymmetric material loss. Use this scale for every zone: 0=no visible wear, 1=light, 2=moderate, 3=heavy. Compare corresponding regions across both shoes and use intact nearby tread as an internal reference. Do not treat shadows, dirt, wetness, printed colour, tread design, or the edge of the shoe as wear.
 
-    smooth = 1 - texture
-
-    g = arr[:, :, 1]
-    r = arr[:, :, 0]
-    b = arr[:, :, 2]
-
-    non_green = 1 - np.clip(g - (r + b) / 2, 0, 1)
-
-    wear = 0.6 * smooth + 0.4 * non_green
-    wear = cv2.GaussianBlur(wear, (0, 0), sigmaX=5)
-
-    return np.clip(wear, 0, 1)
-
-
-def map_to_grid(score, w=10, h=16):
-    H, W = score.shape
-    out = []
-    for y in range(h):
-        row = []
-        for x in range(w):
-            patch = score[
-                int(y * H / h):int((y + 1) * H / h),
-                int(x * W / w):int((x + 1) * W / w)
-            ]
-            row.append(float(np.mean(patch)))
-        out.append(row)
-    return out
+Set usable=false and confidence below 35 if either full sole is not visible, orientation is unclear, blur/glare prevents tread inspection, or wear cannot be distinguished from the original tread design. Keep confidence conservative. The comparison must describe only visible wear evidence. Do not diagnose gait, pronation, supination, injury risk, or a medical condition."""
 
 
-# ===============================
-# ======= OPENAI CALL ===========
-# ===============================
-
-SYSTEM_PROMPT = "Return JSON only with heat_grid."
-
-
-def call_openai(left_url, right_url):
+def assess_zones(left_url: str, right_url: str) -> Dict:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("The visual assessment service is not configured")
     payload = {
         "model": OPENAI_MODEL,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": SYSTEM_PROMPT},
-                    {"type": "input_image", "image_url": left_url},
-                    {"type": "input_image", "image_url": right_url},
-                ],
+        "store": False,
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": ASSESSMENT_PROMPT + "\n\nIMAGE 1 — LEFT SHOE"},
+                {"type": "input_image", "image_url": left_url, "detail": "high"},
+                {"type": "input_text", "text": "IMAGE 2 — RIGHT SHOE"},
+                {"type": "input_image", "image_url": right_url, "detail": "high"},
+            ],
+        }],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "shoe_wear_zones",
+                "strict": True,
+                "schema": ANALYSIS_SCHEMA,
             }
-        ],
-        "max_output_tokens": 2000,
+        },
+        "max_output_tokens": 1200,
     }
-
-    r = httpx.post(
+    response = httpx.post(
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
         json=payload,
-        timeout=60,
+        timeout=90,
     )
-
-    return json.loads(r.text)
-
-
-# ===============================
-# ======= HEATMAP ===============
-# ===============================
-
-def make_heatmap(img_bytes, grid):
-    base = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
-    w, h = base.size
-
-    g = np.array(grid)
-    heat = cv2.resize(g, (w, h))
-    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=10)
-
-    heat = heat / (heat.max() + 1e-6)
-
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[..., 0] = 255
-    rgba[..., 1] = 255 - heat * 255
-    rgba[..., 3] = heat * 180
-
-    overlay = Image.fromarray(rgba, "RGBA")
-    out = Image.alpha_composite(base, overlay)
-
-    buf = io.BytesIO()
-    out.save(buf, format="PNG")
-
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    if response.status_code >= 400:
+        detail = response.json().get("error", {}).get("message", "Visual assessment request failed")
+        raise RuntimeError(detail)
+    body = response.json()
+    output_text = body.get("output_text")
+    if not output_text:
+        for item in body.get("output", []):
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    output_text = content.get("text")
+                    break
+    if not output_text:
+        raise RuntimeError("The visual assessment returned no structured result")
+    return json.loads(output_text)
 
 
-# ===============================
-# ======= API ===================
-# ===============================
+def sole_mask(img: np.ndarray, box):
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = box
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    mask = np.zeros((h, w), np.uint8)
+    if x1 > 1 or y1 > 1 or x2 < w - 1 or y2 < h - 1:
+        grab = np.zeros((h, w), np.uint8)
+        bgd = np.zeros((1, 65), np.float64)
+        fgd = np.zeros((1, 65), np.float64)
+        try:
+            cv2.grabCut(img, grab, (x1, y1, max(2, x2 - x1), max(2, y2 - y1)), bgd, fgd, 3, cv2.GC_INIT_WITH_RECT)
+            mask = np.where((grab == cv2.GC_FGD) | (grab == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+        except Exception:
+            mask[y1:y2, x1:x2] = 255
+    else:
+        mask[y1:y2, x1:x2] = 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+
+def zone_value(scores: Dict, y: float, x: float, side: str):
+    medial = x > 0.5 if side == "left" else x < 0.5
+    if y >= 0.82:
+        return scores["toe"]
+    if y >= 0.57:
+        if x < 0.34 or x > 0.66:
+            return scores["forefoot_medial" if medial else "forefoot_lateral"]
+        return scores["forefoot_central"]
+    if y >= 0.32:
+        return scores["midfoot_medial" if medial else "midfoot_lateral"]
+    if x < 0.34 or x > 0.66:
+        return scores["heel_medial" if medial else "heel_lateral"]
+    return scores["heel_central"]
+
+
+def overlay_heatmap(jpeg: bytes, img: np.ndarray, box, scores: Dict, side: str):
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = box
+    box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
+    heat = np.zeros((h, w), np.float32)
+    for py in range(max(0, y1), min(h, y2)):
+        # The guide places the heel nearest the camera (top after display rotation is not guaranteed),
+        # so normalized y is reversed: heel=0, toe=1.
+        ny = (y2 - py) / box_h
+        for px in range(max(0, x1), min(w, x2)):
+            nx = (px - x1) / box_w
+            heat[py, px] = zone_value(scores, ny, nx, side) / 3.0
+    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=max(7, box_w * 0.035))
+    heat *= sole_mask(img, box).astype(np.float32) / 255.0
+    colour = cv2.applyColorMap(np.uint8(np.clip(heat, 0, 1) * 255), cv2.COLORMAP_TURBO)
+    alpha = np.clip(heat * 0.68, 0, 0.68)[..., None]
+    composed = (img.astype(np.float32) * (1 - alpha) + colour.astype(np.float32) * alpha).astype(np.uint8)
+    output = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(output)
+    buffer = io.BytesIO()
+    pil.save(buffer, format="JPEG", quality=92, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "HYBRID-V2"}
+    return {"ok": True, "marker": "ZONAL-V3"}
 
 
 @app.post("/analyze")
 async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
     try:
-        left_bytes = await left.read()
-        right_bytes = await right.read()
-
-        left_crop, left_detection = crop_sole(left_bytes)
-        right_crop, right_detection = crop_sole(right_bytes)
-
-        left_cv = compute_cv_abrasion_map(left_crop)
-        right_cv = compute_cv_abrasion_map(right_crop)
-
-        left_grid = map_to_grid(left_cv)
-        right_grid = map_to_grid(right_cv)
-
+        left_jpeg, left_img = prepare_image(await left.read())
+        right_jpeg, right_img = prepare_image(await right.read())
+        left_box, left_method, left_detection = locate_sole(left_img)
+        right_box, right_method, right_detection = locate_sole(right_img)
+        assessment = assess_zones(image_data_url(left_jpeg), image_data_url(right_jpeg))
+        if not assessment["usable"]:
+            return JSONResponse({
+                "detail": "These photographs do not show enough reliable tread detail for an assessment.",
+                "assessment": assessment,
+            }, status_code=422)
         return {
-            "left_heatmap_data_url": make_heatmap(left_crop, left_grid),
-            "right_heatmap_data_url": make_heatmap(right_crop, right_grid),
-            "debug": {
-                "left_grid": left_grid,
-                "right_grid": right_grid,
-            },
+            "left_heatmap_data_url": overlay_heatmap(left_jpeg, left_img, left_box, assessment["left"], "left"),
+            "right_heatmap_data_url": overlay_heatmap(right_jpeg, right_img, right_box, assessment["right"], "right"),
+            "assessment": assessment,
             "quality": {
-                "left": left_detection,
-                "right": right_detection,
+                "left": {"crop_method": left_method, "detection_confidence": left_detection},
+                "right": {"crop_method": right_method, "detection_confidence": right_detection},
             },
         }
-
-    except Exception as e:
-        return JSONResponse({"detail": str(e)}, status_code=500)
+    except Exception as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=500)
