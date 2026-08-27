@@ -106,7 +106,7 @@ ZONE_KEYS = [
 ANALYSIS_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["usable", "confidence", "left", "right", "comparison", "limitations"],
+    "required": ["usable", "confidence", "left", "right", "left_patches", "right_patches", "comparison", "limitations"],
     "properties": {
         "usable": {"type": "boolean"},
         "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -120,20 +120,75 @@ ANALYSIS_SCHEMA = {
             "required": ZONE_KEYS,
             "properties": {key: {"type": "integer", "minimum": 0, "maximum": 3} for key in ZONE_KEYS},
         },
+        "left_patches": {
+            "type": "array", "maxItems": 14,
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["x", "y", "width", "height", "intensity", "evidence"],
+                "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "width": {"type": "integer", "minimum": 3, "maximum": 50},
+                    "height": {"type": "integer", "minimum": 3, "maximum": 50},
+                    "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "evidence": {"type": "string", "enum": ["smoothing", "rounded_edges", "tread_loss", "abrasion"]},
+                },
+            },
+        },
+        "right_patches": {
+            "type": "array", "maxItems": 14,
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["x", "y", "width", "height", "intensity", "evidence"],
+                "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "width": {"type": "integer", "minimum": 3, "maximum": 50},
+                    "height": {"type": "integer", "minimum": 3, "maximum": 50},
+                    "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "evidence": {"type": "string", "enum": ["smoothing", "rounded_edges", "tread_loss", "abrasion"]},
+                },
+            },
+        },
         "comparison": {"type": "string"},
         "limitations": {"type": "string"},
     },
 }
 
-ASSESSMENT_PROMPT = """You are assessing visible running-shoe outsole wear from two photographs.
-Image 1 is the LEFT shoe; Image 2 is the RIGHT shoe. The user was told to point both toes away from the camera, with heels nearest the camera.
+ASSESSMENT_PROMPT = """Assess visible running-shoe outsole wear. You receive a clean crop and a coordinate-grid copy for each sole. The grid copy is ONLY for locating evidence; inspect tread detail in the clean crop. Coordinates are percentages within each crop: x=0 left edge, x=100 right edge, y=0 top, y=100 bottom.
 
-Score only visually supported loss of tread depth, rounded tread edges, smoothing/polishing, abrasion, or clearly asymmetric material loss. Use this scale for every zone: 0=no visible wear, 1=light, 2=moderate, 3=heavy. Compare corresponding regions across both shoes and use intact nearby tread as an internal reference. Do not treat shadows, dirt, wetness, printed colour, tread design, or the edge of the shoe as wear.
+First compare repeated tread blocks within the same sole and corresponding areas across both soles. Detect only local patches where the rubber is visibly smoother or polished, tread edges are rounded, grooves/lugs have visibly lost depth, or abrasion/material loss is clear. Smooth factory rubber, recessed channels, shadows, dirt, glare, printed colour and naturally different tread compounds are not wear. Do not mark a broad zone when only a small patch is supported.
 
-Set usable=false and confidence below 35 if either full sole is not visible, orientation is unclear, blur/glare prevents tread inspection, or wear cannot be distinguished from the original tread design. Keep confidence conservative. The comparison must describe only visible wear evidence. Do not diagnose gait, pronation, supination, injury risk, or a medical condition."""
+For each supported patch, return its centre x/y and a tight elliptical width/height. Intensity: 1=slight but visible smoothing/rounding, 2=clear flattening or tread-depth reduction, 3=pronounced material/tread loss. Return no patch when wear is not visually distinguishable. The nine zone scores must summarize these same patches using 0=no visible wear, 1=light, 2=moderate, 3=heavy.
+
+Set usable=false and confidence below 35 if either sole is incomplete, perspective is strongly oblique, blur/glare hides tread, or original design cannot be distinguished from wear. Confidence measures evidence quality, not certainty about gait. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
 
 
-def assess_zones(left_url: str, right_url: str) -> Dict:
+def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str:
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = box
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+    crop = img[y1:y2, x1:x2].copy()
+    if crop.size == 0:
+        crop = img.copy()
+    if with_grid:
+        ch, cw = crop.shape[:2]
+        for index in range(1, 10):
+            x, y = round(cw * index / 10), round(ch * index / 10)
+            cv2.line(crop, (x, 0), (x, ch), (255, 255, 255), max(1, cw // 500))
+            cv2.line(crop, (0, y), (cw, y), (255, 255, 255), max(1, cw // 500))
+        for row in range(10):
+            for col in range(10):
+                label = f"{col}{row}"
+                cv2.putText(crop, label, (round(cw * col / 10) + 3, round(ch * row / 10) + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(crop, label, (round(cw * col / 10) + 3, round(ch * row / 10) + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+    ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 94])
+    if not ok:
+        raise ValueError("Could not prepare the sole crop")
+    return "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode()
+
+
+def assess_zones(left_clean: str, left_grid: str, right_clean: str, right_grid: str) -> Dict:
     if not OPENAI_API_KEY:
         raise RuntimeError("The visual assessment service is not configured")
     payload = {
@@ -142,16 +197,20 @@ def assess_zones(left_url: str, right_url: str) -> Dict:
         "input": [{
             "role": "user",
             "content": [
-                {"type": "input_text", "text": ASSESSMENT_PROMPT + "\n\nIMAGE 1 — LEFT SHOE"},
-                {"type": "input_image", "image_url": left_url, "detail": "high"},
-                {"type": "input_text", "text": "IMAGE 2 — RIGHT SHOE"},
-                {"type": "input_image", "image_url": right_url, "detail": "high"},
+                {"type": "input_text", "text": ASSESSMENT_PROMPT + "\n\nLEFT SHOE — CLEAN CROP"},
+                {"type": "input_image", "image_url": left_clean, "detail": "high"},
+                {"type": "input_text", "text": "LEFT SHOE — COORDINATE GUIDE"},
+                {"type": "input_image", "image_url": left_grid, "detail": "high"},
+                {"type": "input_text", "text": "RIGHT SHOE — CLEAN CROP"},
+                {"type": "input_image", "image_url": right_clean, "detail": "high"},
+                {"type": "input_text", "text": "RIGHT SHOE — COORDINATE GUIDE"},
+                {"type": "input_image", "image_url": right_grid, "detail": "high"},
             ],
         }],
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "shoe_wear_zones",
+                "name": "shoe_wear_patches",
                 "strict": True,
                 "schema": ANALYSIS_SCHEMA,
             }
@@ -201,37 +260,22 @@ def sole_mask(img: np.ndarray, box):
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
-def zone_value(scores: Dict, y: float, x: float, side: str):
-    medial = x > 0.5 if side == "left" else x < 0.5
-    if y >= 0.82:
-        return scores["toe"]
-    if y >= 0.57:
-        if x < 0.34 or x > 0.66:
-            return scores["forefoot_medial" if medial else "forefoot_lateral"]
-        return scores["forefoot_central"]
-    if y >= 0.32:
-        return scores["midfoot_medial" if medial else "midfoot_lateral"]
-    if x < 0.34 or x > 0.66:
-        return scores["heel_medial" if medial else "heel_lateral"]
-    return scores["heel_central"]
-
-
-def overlay_heatmap(jpeg: bytes, img: np.ndarray, box, scores: Dict, side: str):
+def overlay_heatmap(img: np.ndarray, box, patches):
     h, w = img.shape[:2]
     x1, y1, x2, y2 = box
     box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
     heat = np.zeros((h, w), np.float32)
-    for py in range(max(0, y1), min(h, y2)):
-        # The guide places the heel nearest the camera (top after display rotation is not guaranteed),
-        # so normalized y is reversed: heel=0, toe=1.
-        ny = (y2 - py) / box_h
-        for px in range(max(0, x1), min(w, x2)):
-            nx = (px - x1) / box_w
-            heat[py, px] = zone_value(scores, ny, nx, side) / 3.0
-    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=max(7, box_w * 0.035))
+    for patch in patches:
+        centre = (round(x1 + box_w * patch["x"] / 100), round(y1 + box_h * patch["y"] / 100))
+        axes = (max(3, round(box_w * patch["width"] / 200)), max(3, round(box_h * patch["height"] / 200)))
+        layer = np.zeros((h, w), np.float32)
+        cv2.ellipse(layer, centre, axes, 0, 0, 360, float(patch["intensity"]) / 3.0, -1, cv2.LINE_AA)
+        layer = cv2.GaussianBlur(layer, (0, 0), sigmaX=max(3, min(axes) * 0.18))
+        heat = np.maximum(heat, layer)
     heat *= sole_mask(img, box).astype(np.float32) / 255.0
-    colour = cv2.applyColorMap(np.uint8(np.clip(heat, 0, 1) * 255), cv2.COLORMAP_TURBO)
-    alpha = np.clip(heat * 0.68, 0, 0.68)[..., None]
+    colour = np.zeros_like(img)
+    colour[:, :] = (24, 24, 238)
+    alpha = np.clip(heat * 0.62, 0, 0.62)[..., None]
     composed = (img.astype(np.float32) * (1 - alpha) + colour.astype(np.float32) * alpha).astype(np.uint8)
     output = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(output)
@@ -242,7 +286,7 @@ def overlay_heatmap(jpeg: bytes, img: np.ndarray, box, scores: Dict, side: str):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "ZONAL-V3"}
+    return {"ok": True, "marker": "PATCH-RED-V4"}
 
 
 @app.post("/analyze")
@@ -252,15 +296,20 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
         right_jpeg, right_img = prepare_image(await right.read())
         left_box, left_method, left_detection = locate_sole(left_img)
         right_box, right_method, right_detection = locate_sole(right_img)
-        assessment = assess_zones(image_data_url(left_jpeg), image_data_url(right_jpeg))
+        assessment = assess_zones(
+            analysis_crop_data_url(left_img, left_box),
+            analysis_crop_data_url(left_img, left_box, True),
+            analysis_crop_data_url(right_img, right_box),
+            analysis_crop_data_url(right_img, right_box, True),
+        )
         if not assessment["usable"]:
             return JSONResponse({
                 "detail": "These photographs do not show enough reliable tread detail for an assessment.",
                 "assessment": assessment,
             }, status_code=422)
         return {
-            "left_heatmap_data_url": overlay_heatmap(left_jpeg, left_img, left_box, assessment["left"], "left"),
-            "right_heatmap_data_url": overlay_heatmap(right_jpeg, right_img, right_box, assessment["right"], "right"),
+            "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_patches"]),
+            "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_patches"]),
             "assessment": assessment,
             "quality": {
                 "left": {"crop_method": left_method, "detection_confidence": left_detection},
