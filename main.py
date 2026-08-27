@@ -223,10 +223,23 @@ def assess_zones(left_original: str, left_grid: str, right_original: str, right_
     first = request_assessment(images)
     audit = (
         "\n\nAct as a skeptical second-pass verifier. Audit the candidate map below against the photographs. "
-        "Remove every false positive containing visible manufactured lines or contours. Add missed cells where expected repeated texture is genuinely erased into smooth rubber. "
+        "Remove false positives only where manufactured lines, contours or mould texture visibly occupy most of the candidate cell. "
+        "Do not equate faint residual lines with an unworn surface: a worn block can retain a few contours while its original fine texture has been smoothed away. "
+        "Preserve strong candidates unless there is positive visual evidence they are manufactured geometry. Add missed cells where expected repeated or fine texture is erased into smooth rubber. "
+        "A used outsole with broad smooth rubber should not collapse to an all-zero map merely because some large factory contours remain. "
         "Return a complete corrected result, not commentary.\nCANDIDATE:\n" + json.dumps(first, separators=(",", ":"))
     )
     verified = request_assessment(images + [{"type": "input_text", "text": audit}])
+    # The independent verifier is a false-positive check, not an absolute veto.
+    # Preserve high-confidence first-pass evidence at one step lower when disputed.
+    for side in ("left", "right"):
+        key = f"{side}_grid"
+        verified[key] = [
+            max(second, max(0, initial - 1))
+            for initial, second in zip(first[key], verified[key])
+        ]
+        for zone in ZONE_KEYS:
+            verified[side][zone] = max(verified[side][zone], max(0, first[side][zone] - 1))
     verified["confidence"] = min(first["confidence"], verified["confidence"])
     return verified
 
