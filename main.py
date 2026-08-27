@@ -18,7 +18,7 @@ from ultralytics import YOLOWorld
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 MAX_IMAGE_SIDE = 1800
 GRID_COLS = 10
 GRID_ROWS = 20
@@ -176,6 +176,7 @@ def request_assessment(content) -> Dict:
     payload = {
         "model": OPENAI_MODEL,
         "store": False,
+        "reasoning": {"effort": "low"},
         "input": [{"role": "user", "content": content}],
         "text": {
             "format": {
@@ -185,7 +186,7 @@ def request_assessment(content) -> Dict:
                 "schema": ANALYSIS_SCHEMA,
             }
         },
-        "max_output_tokens": 5000,
+        "max_output_tokens": 8000,
     }
     response = httpx.post(
         "https://api.openai.com/v1/responses",
@@ -289,7 +290,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "DENSE-VERIFIED-V5"}
+    return {"ok": True, "marker": "GPT5-DENSE-VERIFIED-V6"}
 
 
 @app.post("/analyze")
