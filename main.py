@@ -20,6 +20,9 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 MAX_IMAGE_SIDE = 1800
+GRID_COLS = 10
+GRID_ROWS = 20
+GRID_CELLS = GRID_COLS * GRID_ROWS
 
 app = FastAPI(title="CheckMyRun")
 app.add_middleware(
@@ -106,7 +109,7 @@ ZONE_KEYS = [
 ANALYSIS_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["usable", "confidence", "left", "right", "left_patches", "right_patches", "comparison", "limitations"],
+    "required": ["usable", "confidence", "left", "right", "left_grid", "right_grid", "comparison", "limitations"],
     "properties": {
         "usable": {"type": "boolean"},
         "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -120,48 +123,24 @@ ANALYSIS_SCHEMA = {
             "required": ZONE_KEYS,
             "properties": {key: {"type": "integer", "minimum": 0, "maximum": 3} for key in ZONE_KEYS},
         },
-        "left_patches": {
-            "type": "array", "maxItems": 14,
-            "items": {
-                "type": "object", "additionalProperties": False,
-                "required": ["x", "y", "width", "height", "intensity", "evidence"],
-                "properties": {
-                    "x": {"type": "integer", "minimum": 0, "maximum": 100},
-                    "y": {"type": "integer", "minimum": 0, "maximum": 100},
-                    "width": {"type": "integer", "minimum": 3, "maximum": 50},
-                    "height": {"type": "integer", "minimum": 3, "maximum": 50},
-                    "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
-                    "evidence": {"type": "string", "enum": ["smoothing", "rounded_edges", "tread_loss", "abrasion"]},
-                },
-            },
-        },
-        "right_patches": {
-            "type": "array", "maxItems": 14,
-            "items": {
-                "type": "object", "additionalProperties": False,
-                "required": ["x", "y", "width", "height", "intensity", "evidence"],
-                "properties": {
-                    "x": {"type": "integer", "minimum": 0, "maximum": 100},
-                    "y": {"type": "integer", "minimum": 0, "maximum": 100},
-                    "width": {"type": "integer", "minimum": 3, "maximum": 50},
-                    "height": {"type": "integer", "minimum": 3, "maximum": 50},
-                    "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
-                    "evidence": {"type": "string", "enum": ["smoothing", "rounded_edges", "tread_loss", "abrasion"]},
-                },
-            },
-        },
+        "left_grid": {"type": "array", "minItems": GRID_CELLS, "maxItems": GRID_CELLS,
+                      "items": {"type": "integer", "minimum": 0, "maximum": 3}},
+        "right_grid": {"type": "array", "minItems": GRID_CELLS, "maxItems": GRID_CELLS,
+                       "items": {"type": "integer", "minimum": 0, "maximum": 3}},
         "comparison": {"type": "string"},
         "limitations": {"type": "string"},
     },
 }
 
-ASSESSMENT_PROMPT = """Assess visible running-shoe outsole wear. You receive a clean crop and a coordinate-grid copy for each sole. The grid copy is ONLY for locating evidence; inspect tread detail in the clean crop. Coordinates are percentages within each crop: x=0 left edge, x=100 right edge, y=0 top, y=100 bottom.
+ASSESSMENT_PROMPT = f"""Map visible running-shoe outsole wear at high spatial precision. You receive each untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all 10 cells of row 0 left-to-right, then row 1, through row 19.
 
-First compare repeated tread blocks within the same sole and corresponding areas across both soles. Detect only local patches where the rubber is visibly smoother or polished, tread edges are rounded, grooves/lugs have visibly lost depth, or abrasion/material loss is clear. Smooth factory rubber, recessed channels, shadows, dirt, glare, printed colour and naturally different tread compounds are not wear. Do not mark a broad zone when only a small patch is supported.
+The definition of wear is strict: rubber has become abnormally smooth because manufactured surface texture has been erased or flattened. First infer the intended moulded texture from adjacent repeated blocks, continuous lines, the matching shoe, and symmetric parts of the same rubber compound. Then identify interruptions where that expected texture disappears.
 
-For each supported patch, return its centre x/y and a tight elliptical width/height. Intensity: 1=slight but visible smoothing/rounding, 2=clear flattening or tread-depth reduction, 3=pronounced material/tread loss. Return no patch when wear is not visually distinguishable. The nine zone scores must summarize these same patches using 0=no visible wear, 1=light, 2=moderate, 3=heavy.
+CRITICAL NEGATIVE RULE: visible man-made contours, grooves, ridges, ribs, tread lines, stippling, logos, mould seams and clean geometric edges are evidence of intact manufactured texture. Do NOT colour them as wear. Also do not confuse factory-smooth areas, recessed foam/channels, dirt, shadows, glare, colour changes or photographic blur with wear.
 
-Set usable=false and confidence below 35 if either sole is incomplete, perspective is strongly oblique, blur/glare hides tread, or original design cannot be distinguished from wear. Confidence measures evidence quality, not certainty about gait. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
+For every grid cell return 0 when outside rubber, uncertain, factory-smooth, or manufactured detail remains; 1 when part of the cell has credible local texture loss; 2 for clear smooth/flattened rubber replacing expected texture; 3 only for pronounced polished smoothness or material loss. A cell may be nonzero when only part is worn; the renderer will soften boundaries. Be sensitive to all genuine smooth interruptions, including small ones, but require a visible texture expectation. The nine zone scores summarize the same evidence: 0 none, 1 light, 2 moderate, 3 heavy.
+
+Set usable=false and confidence below 35 if either sole is incomplete, strongly oblique, blurred, glared, or the original design cannot be inferred. Confidence measures photographic evidence only. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
 
 
 def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str:
@@ -173,40 +152,31 @@ def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str
         crop = img.copy()
     if with_grid:
         ch, cw = crop.shape[:2]
-        for index in range(1, 10):
-            x, y = round(cw * index / 10), round(ch * index / 10)
+        for index in range(1, GRID_COLS):
+            x = round(cw * index / GRID_COLS)
             cv2.line(crop, (x, 0), (x, ch), (255, 255, 255), max(1, cw // 500))
+        for index in range(1, GRID_ROWS):
+            y = round(ch * index / GRID_ROWS)
             cv2.line(crop, (0, y), (cw, y), (255, 255, 255), max(1, cw // 500))
-        for row in range(10):
-            for col in range(10):
-                label = f"{col}{row}"
-                cv2.putText(crop, label, (round(cw * col / 10) + 3, round(ch * row / 10) + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(crop, label, (round(cw * col / 10) + 3, round(ch * row / 10) + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        for row in range(GRID_ROWS):
+            for col in range(GRID_COLS):
+                label = f"{row:02d},{col}"
+                origin = (round(cw * col / GRID_COLS) + 2, round(ch * row / GRID_ROWS) + 12)
+                cv2.putText(crop, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(crop, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1, cv2.LINE_AA)
     ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 94])
     if not ok:
         raise ValueError("Could not prepare the sole crop")
     return "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode()
 
 
-def assess_zones(left_clean: str, left_grid: str, right_clean: str, right_grid: str) -> Dict:
+def request_assessment(content) -> Dict:
     if not OPENAI_API_KEY:
         raise RuntimeError("The visual assessment service is not configured")
     payload = {
         "model": OPENAI_MODEL,
         "store": False,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": ASSESSMENT_PROMPT + "\n\nLEFT SHOE — CLEAN CROP"},
-                {"type": "input_image", "image_url": left_clean, "detail": "high"},
-                {"type": "input_text", "text": "LEFT SHOE — COORDINATE GUIDE"},
-                {"type": "input_image", "image_url": left_grid, "detail": "high"},
-                {"type": "input_text", "text": "RIGHT SHOE — CLEAN CROP"},
-                {"type": "input_image", "image_url": right_clean, "detail": "high"},
-                {"type": "input_text", "text": "RIGHT SHOE — COORDINATE GUIDE"},
-                {"type": "input_image", "image_url": right_grid, "detail": "high"},
-            ],
-        }],
+        "input": [{"role": "user", "content": content}],
         "text": {
             "format": {
                 "type": "json_schema",
@@ -215,7 +185,7 @@ def assess_zones(left_clean: str, left_grid: str, right_clean: str, right_grid: 
                 "schema": ANALYSIS_SCHEMA,
             }
         },
-        "max_output_tokens": 3000,
+        "max_output_tokens": 5000,
     }
     response = httpx.post(
         "https://api.openai.com/v1/responses",
@@ -239,6 +209,28 @@ def assess_zones(left_clean: str, left_grid: str, right_clean: str, right_grid: 
     return json.loads(output_text)
 
 
+def assess_zones(left_original: str, left_grid: str, right_original: str, right_grid: str) -> Dict:
+    images = [
+        {"type": "input_text", "text": ASSESSMENT_PROMPT + "\n\nLEFT SHOE — UNTOUCHED FULL PHOTOGRAPH"},
+        {"type": "input_image", "image_url": left_original, "detail": "high"},
+        {"type": "input_text", "text": "LEFT SHOE — LOCATION GUIDE ONLY"},
+        {"type": "input_image", "image_url": left_grid, "detail": "high"},
+        {"type": "input_text", "text": "RIGHT SHOE — UNTOUCHED FULL PHOTOGRAPH"},
+        {"type": "input_image", "image_url": right_original, "detail": "high"},
+        {"type": "input_text", "text": "RIGHT SHOE — LOCATION GUIDE ONLY"},
+        {"type": "input_image", "image_url": right_grid, "detail": "high"},
+    ]
+    first = request_assessment(images)
+    audit = (
+        "\n\nAct as a skeptical second-pass verifier. Audit the candidate map below against the photographs. "
+        "Remove every false positive containing visible manufactured lines or contours. Add missed cells where expected repeated texture is genuinely erased into smooth rubber. "
+        "Return a complete corrected result, not commentary.\nCANDIDATE:\n" + json.dumps(first, separators=(",", ":"))
+    )
+    verified = request_assessment(images + [{"type": "input_text", "text": audit}])
+    verified["confidence"] = min(first["confidence"], verified["confidence"])
+    return verified
+
+
 def sole_mask(img: np.ndarray, box):
     h, w = img.shape[:2]
     x1, y1, x2, y2 = box
@@ -260,22 +252,20 @@ def sole_mask(img: np.ndarray, box):
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
-def overlay_heatmap(img: np.ndarray, box, patches):
+def overlay_heatmap(img: np.ndarray, box, grid_values):
     h, w = img.shape[:2]
     x1, y1, x2, y2 = box
     box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
+    coarse = np.asarray(grid_values, dtype=np.float32).reshape(GRID_ROWS, GRID_COLS) / 3.0
+    mapped = cv2.resize(coarse, (box_w, box_h), interpolation=cv2.INTER_CUBIC)
+    mapped = cv2.GaussianBlur(mapped, (0, 0), sigmaX=max(2, box_w / GRID_COLS * 0.16), sigmaY=max(2, box_h / GRID_ROWS * 0.16))
     heat = np.zeros((h, w), np.float32)
-    for patch in patches:
-        centre = (round(x1 + box_w * patch["x"] / 100), round(y1 + box_h * patch["y"] / 100))
-        axes = (max(3, round(box_w * patch["width"] / 200)), max(3, round(box_h * patch["height"] / 200)))
-        layer = np.zeros((h, w), np.float32)
-        cv2.ellipse(layer, centre, axes, 0, 0, 360, float(patch["intensity"]) / 3.0, -1, cv2.LINE_AA)
-        layer = cv2.GaussianBlur(layer, (0, 0), sigmaX=max(3, min(axes) * 0.18))
-        heat = np.maximum(heat, layer)
+    heat[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = np.clip(mapped, 0, 1)[:min(h, y2)-max(0, y1), :min(w, x2)-max(0, x1)]
     heat *= sole_mask(img, box).astype(np.float32) / 255.0
     colour = np.zeros_like(img)
     colour[:, :] = (24, 24, 238)
-    alpha = np.clip(heat * 0.62, 0, 0.62)[..., None]
+    alpha = np.where(heat > 0.06, 0.12 + heat * 0.52, 0.0)
+    alpha = np.clip(alpha, 0, 0.64)[..., None]
     composed = (img.astype(np.float32) * (1 - alpha) + colour.astype(np.float32) * alpha).astype(np.uint8)
     output = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(output)
@@ -286,7 +276,7 @@ def overlay_heatmap(img: np.ndarray, box, patches):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "PATCH-RED-V4"}
+    return {"ok": True, "marker": "DENSE-VERIFIED-V5"}
 
 
 @app.post("/analyze")
@@ -297,9 +287,9 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
         left_box, left_method, left_detection = locate_sole(left_img)
         right_box, right_method, right_detection = locate_sole(right_img)
         assessment = assess_zones(
-            analysis_crop_data_url(left_img, left_box),
+            image_data_url(left_jpeg),
             analysis_crop_data_url(left_img, left_box, True),
-            analysis_crop_data_url(right_img, right_box),
+            image_data_url(right_jpeg),
             analysis_crop_data_url(right_img, right_box, True),
         )
         if not assessment["usable"]:
@@ -308,8 +298,8 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
                 "assessment": assessment,
             }, status_code=422)
         return {
-            "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_patches"]),
-            "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_patches"]),
+            "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_grid"]),
+            "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_grid"]),
             "assessment": assessment,
             "quality": {
                 "left": {"crop_method": left_method, "detection_confidence": left_detection},
