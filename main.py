@@ -254,13 +254,13 @@ def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
     if heel_score > 0:
         # The required photo position fixes heel at the bottom. Reinforce the
         # anatomical outer heel when the zonal verdict and dense map disagree.
-        lateral_cols = range(0, 5) if side == "left" else range(GRID_COLS - 5, GRID_COLS)
+        lateral_cols = range(0, 4) if side == "left" else range(GRID_COLS - 4, GRID_COLS)
         target = float(heel_score) / 3.0
-        for row in range(GRID_ROWS - 5, GRID_ROWS - 1):
+        for row in range(GRID_ROWS - 4, GRID_ROWS - 1):
             for col in lateral_cols:
-                distance = abs(row - (GRID_ROWS - 3)) / 3 + abs(col - (2 if side == "left" else GRID_COLS - 3)) / 4
-                if distance < 1.15:
-                    coarse[row, col] = max(coarse[row, col], target * (1.0 - distance * 0.35))
+                distance = abs(row - (GRID_ROWS - 3)) / 2.2 + abs(col - (1.5 if side == "left" else GRID_COLS - 2.5)) / 2.8
+                if distance < 1.0:
+                    coarse[row, col] = max(coarse[row, col], target * (1.0 - distance * 0.45))
     cell_w, cell_h = box_w / GRID_COLS, box_h / GRID_ROWS
 
     # Render each positive cell as a soft evidence centre. Adjacent centres merge
@@ -294,7 +294,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
         low, high = np.percentile(edge_density, (25, 78))
         if high > low + 0.01:
             smoothness = 1.0 - np.clip((edge_density - low) / (high - low), 0, 1)
-            mapped *= 0.28 + 0.72 * smoothness
+            mapped *= 0.06 + 0.94 * np.power(smoothness, 1.55)
     heat = np.zeros((h, w), np.float32)
     heat[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = np.clip(mapped, 0, 1)[:min(h, y2)-max(0, y1), :min(w, x2)-max(0, x1)]
     heat *= sole_mask(img, box).astype(np.float32) / 255.0
@@ -302,7 +302,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
     colour[:, :] = (24, 24, 238)
     # Continuous opacity avoids rectangular threshold edges. Only negligible haze
     # is removed; credible evidence remains clearly visible.
-    alpha = np.clip(heat * 1.85, 0, 0.78)
+    alpha = np.clip(heat * 1.58, 0, 0.76)
     alpha[alpha < 0.035] = 0
     alpha = alpha[..., None]
     composed = (img.astype(np.float32) * (1 - alpha) + colour.astype(np.float32) * alpha).astype(np.uint8)
@@ -315,7 +315,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "BLOBBY-HEEL-REINFORCED-V12"}
+    return {"ok": True, "marker": "BLOBBY-TREAD-FILTERED-V13"}
 
 
 @app.post("/analyze")
