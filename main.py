@@ -134,11 +134,11 @@ ANALYSIS_SCHEMA = {
 
 ASSESSMENT_PROMPT = f"""Map visible running-shoe outsole wear at high spatial precision. You receive each untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all 10 cells of row 0 left-to-right, then row 1, through row 19.
 
-The definition of wear is strict: rubber has become abnormally smooth because manufactured surface texture has been erased or flattened. First infer the intended moulded texture from adjacent repeated blocks, continuous lines, the matching shoe, and symmetric parts of the same rubber compound. Then identify interruptions where that expected texture disappears.
+The definition of wear is rubber that has become abnormally smooth because manufactured surface texture has been erased or flattened. First inspect the TOE PAD and HEEL PAD separately on both shoes; these high-contact areas are commonly the clearest wear and must not be skipped. Then infer intended texture from faint surviving texture around a smooth area's edges, adjacent portions of the same continuous rubber pad, repeated blocks, the matching shoe, and symmetric parts of the same compound. Mark the interruption where expected fine texture fades or disappears, even when larger moulded contours remain.
 
-CRITICAL NEGATIVE RULE: visible man-made contours, grooves, ridges, ribs, tread lines, stippling, logos, mould seams and clean geometric edges are evidence of intact manufactured texture. Do NOT colour them as wear. Also do not confuse factory-smooth areas, recessed foam/channels, dirt, shadows, glare, colour changes or photographic blur with wear.
+CRITICAL NEGATIVE RULE: visible man-made contours, grooves, ridges, ribs, tread lines, stippling, logos, mould seams and clean geometric edges must not themselves be coloured as wear. However, one or two surviving large contours do NOT make the surrounding rubber unworn when its finer texture has been polished away. Do not assume a broad toe or heel patch is factory-smooth merely because it is uniformly smooth. Call an area factory-smooth only when an intentional geometric boundary or consistent matching examples clearly support that conclusion. Exclude recessed foam/channels, dirt, shadows, glare, colour changes and photographic blur.
 
-For every grid cell return 0 when outside rubber, uncertain, factory-smooth, or manufactured detail remains; 1 when part of the cell has credible local texture loss; 2 for clear smooth/flattened rubber replacing expected texture; 3 only for pronounced polished smoothness or material loss. A cell may be nonzero when only part is worn; the renderer will soften boundaries. Be sensitive to all genuine smooth interruptions, including small ones, but require a visible texture expectation. The nine zone scores summarize the same evidence: 0 none, 1 light, 2 moderate, 3 heavy.
+For every grid cell return 0 when outside rubber, uncertain, intentionally factory-smooth, or fine manufactured texture remains substantially intact; 1 when any meaningful part has credible local texture loss; 2 for clearly smooth/flattened rubber replacing expected texture; 3 for pronounced polished smoothness or material loss. A cell may be nonzero when only part is worn. Prefer sensitivity over omission once adjacent evidence establishes what texture should continue. Before finishing, perform a mandatory second visual sweep of the outer toe edge, central toe pad, outer heel edge and central heel pad and add every supported smooth interruption. The nine zone scores summarize the same evidence: 0 none, 1 light, 2 moderate, 3 heavy.
 
 Set usable=false and confidence below 35 if either sole is incomplete, strongly oblique, blurred, glared, or the original design cannot be inferred. Confidence measures photographic evidence only. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
 
@@ -269,7 +269,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "GPT5-DENSE-SINGLE-V7"}
+    return {"ok": True, "marker": "GPT5-SENSITIVE-TOE-HEEL-V8"}
 
 
 @app.post("/analyze")
