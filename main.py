@@ -245,11 +245,22 @@ def sole_mask(img: np.ndarray, box):
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
-def overlay_heatmap(img: np.ndarray, box, grid_values):
+def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
     h, w = img.shape[:2]
     x1, y1, x2, y2 = box
     box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
     coarse = np.asarray(grid_values, dtype=np.float32).reshape(GRID_ROWS, GRID_COLS) / 3.0
+    heel_score = max(zones["heel_lateral"], zones["heel_central"], zones["heel_medial"])
+    if heel_score > 0:
+        # The required photo position fixes heel at the bottom. Reinforce the
+        # anatomical outer heel when the zonal verdict and dense map disagree.
+        lateral_cols = range(0, 5) if side == "left" else range(GRID_COLS - 5, GRID_COLS)
+        target = float(heel_score) / 3.0
+        for row in range(GRID_ROWS - 5, GRID_ROWS - 1):
+            for col in lateral_cols:
+                distance = abs(row - (GRID_ROWS - 3)) / 3 + abs(col - (2 if side == "left" else GRID_COLS - 3)) / 4
+                if distance < 1.15:
+                    coarse[row, col] = max(coarse[row, col], target * (1.0 - distance * 0.35))
     cell_w, cell_h = box_w / GRID_COLS, box_h / GRID_ROWS
 
     # Render each positive cell as a soft evidence centre. Adjacent centres merge
@@ -291,7 +302,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
     colour[:, :] = (24, 24, 238)
     # Continuous opacity avoids rectangular threshold edges. Only negligible haze
     # is removed; credible evidence remains clearly visible.
-    alpha = np.clip(heat * 1.05, 0, 0.78)
+    alpha = np.clip(heat * 1.85, 0, 0.78)
     alpha[alpha < 0.035] = 0
     alpha = alpha[..., None]
     composed = (img.astype(np.float32) * (1 - alpha) + colour.astype(np.float32) * alpha).astype(np.uint8)
@@ -304,7 +315,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "BLOBBY-SMOOTHNESS-V11"}
+    return {"ok": True, "marker": "BLOBBY-HEEL-REINFORCED-V12"}
 
 
 @app.post("/analyze")
@@ -326,8 +337,8 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
                 "assessment": assessment,
             }, status_code=422)
         return {
-            "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_grid"]),
-            "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_grid"]),
+            "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_grid"], assessment["left"], "left"),
+            "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_grid"], assessment["right"], "right"),
             "assessment": assessment,
             "quality": {
                 "left": {"crop_method": left_method, "detection_confidence": left_detection},
