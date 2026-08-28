@@ -23,6 +23,7 @@ MAX_IMAGE_SIDE = 1800
 GRID_COLS = 14
 GRID_ROWS = 28
 GRID_CELLS = GRID_COLS * GRID_ROWS
+GAVIOTA_5_REFERENCE_URL = "https://photo3.i-run.fr/hoka-one-one-gaviota-5-chaussures-homme-801803-1-z.jpg"
 
 app = FastAPI(title="CheckMyRun")
 app.add_middleware(
@@ -90,9 +91,8 @@ def locate_sole(img: np.ndarray):
             boxes = result.boxes.xyxy.cpu().numpy()
             confidence = result.boxes.conf.cpu().numpy()
             index = int(np.argmax(confidence))
-            if float(confidence[index]) >= 0.45:
-                x1, y1, x2, y2 = map(int, boxes[index])
-                return (x1, y1, x2, y2), "object_detector", round(float(confidence[index]), 3)
+            x1, y1, x2, y2 = map(int, boxes[index])
+            return (x1, y1, x2, y2), "object_detector", round(float(confidence[index]), 3)
     except Exception:
         pass
     fallback = background_box(img)
@@ -133,9 +133,9 @@ ANALYSIS_SCHEMA = {
     },
 }
 
-ASSESSMENT_PROMPT = f"""Map visible running-shoe outsole wear at high spatial precision. You receive each untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all {GRID_COLS} cells of row 0 left-to-right, then row 1, through row {GRID_ROWS - 1}. In the required capture position the rounded TOE is the far/top end of the guide (approximately rows 0-6) and the HEEL is the near/bottom end, usually nearest the hand (approximately rows 21-27). Verify this from the sole anatomy, and never place a heel finding in forefoot rows or a toe finding in heel rows.
+ASSESSMENT_PROMPT = f"""Map visible Hoka Gaviota 5 outsole wear at high spatial precision. The first image is an UNWORN GAVIOTA 5 STRUCTURAL REFERENCE. Its colourway, lighting, scale and rotation are irrelevant. Use only its manufactured geometry: rubber-pad outlines, grooves, ribs, moulded lines, cut-outs and channels. After it, you receive each user's untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all {GRID_COLS} cells of row 0 left-to-right, then row 1, through row {GRID_ROWS - 1}. In the required capture position the rounded TOE is the far/top end of the guide (approximately rows 0-6) and the HEEL is the near/bottom end, usually nearest the hand (approximately rows 21-27). Verify this from the sole anatomy, and never place a heel finding in forefoot rows or a toe finding in heel rows.
 
-The governing rule is CONTINUITY OF MANUFACTURED TEXTURE. Across the sole, trace the man-made lines, ribs, contours, stippling and fine mould texture through every continuous rubber pad. Where that manufactured texture becomes faint, interrupted or absent without an intentional geometric boundary, the smooth gap is wear and must be highlighted. Infer the missing texture from the lines immediately before and after the gap, neighbouring parts of the same pad, repeated blocks, and the matching shoe. First inspect the TOE PAD and HEEL PAD separately; these high-contact areas must not be skipped. Mark the full smooth interruption, not merely its boundary.
+First geometrically align the reference outsole to each user sole using pad outlines, channels and cut-outs—not colour. Then compare corresponding manufactured details. The governing rule is CONTINUITY OF MANUFACTURED TEXTURE. Trace the reference's man-made lines, ribs, contours, stippling and fine mould texture through every corresponding rubber pad. Where expected reference detail becomes faint, interrupted or absent in the user photo without an intentional boundary, the smooth gap is wear and must be highlighted. Confirm with neighbouring texture and the matching shoe. Inspect the TOE PAD and HEEL PAD separately; these high-contact areas must not be skipped. Mark the full smooth interruption, not merely its boundary.
 
 CRITICAL DISTINCTION: visible man-made lines and contours are the reference pattern, not wear. Preserve them, but highlight the adjacent smooth rubber wherever the pattern that should continue no longer exists. A few surviving large contours do not make the surrounding rubber unworn when finer lines have disappeared. Default an unexplained smooth gap inside a patterned rubber pad to wear, not factory-smooth. Call it factory-smooth only when a crisp intentional boundary or repeated identical examples prove that design. Exclude recessed foam/channels, dirt, shadows, glare, colour changes and photographic blur.
 
@@ -213,7 +213,9 @@ def request_assessment(content) -> Dict:
 
 def assess_zones(left_original: str, left_grid: str, right_original: str, right_grid: str) -> Dict:
     images = [
-        {"type": "input_text", "text": ASSESSMENT_PROMPT + "\n\nLEFT SHOE — UNTOUCHED FULL PHOTOGRAPH"},
+        {"type": "input_text", "text": ASSESSMENT_PROMPT + "\n\nUNWORN HOKA GAVIOTA 5 — STRUCTURAL REFERENCE"},
+        {"type": "input_image", "image_url": GAVIOTA_5_REFERENCE_URL, "detail": "high"},
+        {"type": "input_text", "text": "LEFT SHOE — UNTOUCHED FULL PHOTOGRAPH"},
         {"type": "input_image", "image_url": left_original, "detail": "high"},
         {"type": "input_text", "text": "LEFT SHOE — LOCATION GUIDE ONLY"},
         {"type": "input_image", "image_url": left_grid, "detail": "high"},
@@ -316,7 +318,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "FULL-SOLE-BLOBBY-V14"}
+    return {"ok": True, "marker": "GAVIOTA5-REFERENCE-V15"}
 
 
 @app.post("/analyze")
