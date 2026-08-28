@@ -23,7 +23,7 @@ MAX_IMAGE_SIDE = 1800
 GRID_COLS = 14
 GRID_ROWS = 28
 GRID_CELLS = GRID_COLS * GRID_ROWS
-GAVIOTA_5_REFERENCE_URL = "https://photo3.i-run.fr/hoka-one-one-gaviota-5-chaussures-homme-801803-1-z.jpg"
+GAVIOTA_5_REFERENCE_URL = "https://media.au.hoka.com/cdn-cgi/image/fit%3Dscale-down%2Cf%3Dauto%2Cw%3D1280/products/7f6b704b-e124-447f-a3e0-76de84263d5f/7ada0c6d/1134235-hmrg_hmrg_08.jpg"
 
 app = FastAPI(title="CheckMyRun")
 app.add_middleware(
