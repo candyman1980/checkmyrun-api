@@ -132,7 +132,7 @@ ANALYSIS_SCHEMA = {
     },
 }
 
-ASSESSMENT_PROMPT = f"""Map visible running-shoe outsole wear at high spatial precision. You receive each untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all 10 cells of row 0 left-to-right, then row 1, through row 19.
+ASSESSMENT_PROMPT = f"""Map visible running-shoe outsole wear at high spatial precision. You receive each untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all 10 cells of row 0 left-to-right, then row 1, through row 19. In the required capture position the rounded TOE is the far/top end of the guide (approximately rows 0-4) and the HEEL is the near/bottom end, usually nearest the hand (approximately rows 15-19). Verify this from the sole anatomy, and never place a heel finding in forefoot rows or a toe finding in heel rows.
 
 The definition of wear is rubber that has become abnormally smooth because manufactured surface texture has been erased or flattened. First inspect the TOE PAD and HEEL PAD separately on both shoes; these high-contact areas are commonly the clearest wear and must not be skipped. Then infer intended texture from faint surviving texture around a smooth area's edges, adjacent portions of the same continuous rubber pad, repeated blocks, the matching shoe, and symmetric parts of the same compound. Mark the interruption where expected fine texture fades or disappears, even when larger moulded contours remain.
 
@@ -269,7 +269,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "GPT5-SENSITIVE-TOE-HEEL-V8"}
+    return {"ok": True, "marker": "GPT5-ORIENTED-TOE-HEEL-V9"}
 
 
 @app.post("/analyze")
