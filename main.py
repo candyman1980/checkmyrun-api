@@ -90,8 +90,9 @@ def locate_sole(img: np.ndarray):
             boxes = result.boxes.xyxy.cpu().numpy()
             confidence = result.boxes.conf.cpu().numpy()
             index = int(np.argmax(confidence))
-            x1, y1, x2, y2 = map(int, boxes[index])
-            return (x1, y1, x2, y2), "object_detector", round(float(confidence[index]), 3)
+            if float(confidence[index]) >= 0.45:
+                x1, y1, x2, y2 = map(int, boxes[index])
+                return (x1, y1, x2, y2), "object_detector", round(float(confidence[index]), 3)
     except Exception:
         pass
     fallback = background_box(img)
@@ -315,7 +316,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "BLOBBY-TREAD-FILTERED-V13"}
+    return {"ok": True, "marker": "FULL-SOLE-BLOBBY-V14"}
 
 
 @app.post("/analyze")
