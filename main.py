@@ -250,15 +250,50 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
     x1, y1, x2, y2 = box
     box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
     coarse = np.asarray(grid_values, dtype=np.float32).reshape(GRID_ROWS, GRID_COLS) / 3.0
-    mapped = cv2.resize(coarse, (box_w, box_h), interpolation=cv2.INTER_CUBIC)
-    mapped = cv2.GaussianBlur(mapped, (0, 0), sigmaX=max(2, box_w / GRID_COLS * 0.16), sigmaY=max(2, box_h / GRID_ROWS * 0.16))
+    cell_w, cell_h = box_w / GRID_COLS, box_h / GRID_ROWS
+
+    # Render each positive cell as a soft evidence centre. Adjacent centres merge
+    # naturally into irregular wear zones instead of exposing the analysis grid.
+    mapped = np.zeros((box_h, box_w), np.float32)
+    for row in range(GRID_ROWS):
+        for col in range(GRID_COLS):
+            strength = float(coarse[row, col])
+            if strength <= 0:
+                continue
+            centre = (round((col + 0.5) * cell_w), round((row + 0.5) * cell_h))
+            axes = (max(3, round(cell_w * 0.85)), max(3, round(cell_h * 0.85)))
+            cv2.ellipse(mapped, centre, axes, 0, 0, 360, strength, -1, cv2.LINE_AA)
+    mapped = cv2.GaussianBlur(
+        mapped, (0, 0),
+        sigmaX=max(3, cell_w * 0.72),
+        sigmaY=max(3, cell_h * 0.72),
+    )
+
+    # Visible ribs/grooves mean tread is still present. Attenuate model evidence
+    # over locally edge-rich rubber while retaining it over smooth polished areas.
+    crop_gray = cv2.cvtColor(img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)], cv2.COLOR_BGR2GRAY)
+    if crop_gray.shape == mapped.shape:
+        gx = cv2.Sobel(crop_gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(crop_gray, cv2.CV_32F, 0, 1, ksize=3)
+        edge_density = cv2.GaussianBlur(
+            cv2.magnitude(gx, gy), (0, 0),
+            sigmaX=max(2, cell_w * 0.38),
+            sigmaY=max(2, cell_h * 0.38),
+        )
+        low, high = np.percentile(edge_density, (25, 78))
+        if high > low + 0.01:
+            smoothness = 1.0 - np.clip((edge_density - low) / (high - low), 0, 1)
+            mapped *= 0.28 + 0.72 * smoothness
     heat = np.zeros((h, w), np.float32)
     heat[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = np.clip(mapped, 0, 1)[:min(h, y2)-max(0, y1), :min(w, x2)-max(0, x1)]
     heat *= sole_mask(img, box).astype(np.float32) / 255.0
     colour = np.zeros_like(img)
     colour[:, :] = (24, 24, 238)
-    alpha = np.where(heat > 0.045, 0.24 + heat * 0.56, 0.0)
-    alpha = np.clip(alpha, 0, 0.78)[..., None]
+    # Continuous opacity avoids rectangular threshold edges. Only negligible haze
+    # is removed; credible evidence remains clearly visible.
+    alpha = np.clip(heat * 1.05, 0, 0.78)
+    alpha[alpha < 0.035] = 0
+    alpha = alpha[..., None]
     composed = (img.astype(np.float32) * (1 - alpha) + colour.astype(np.float32) * alpha).astype(np.uint8)
     output = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(output)
@@ -269,7 +304,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "TEXTURE-CONTINUITY-V10"}
+    return {"ok": True, "marker": "BLOBBY-SMOOTHNESS-V11"}
 
 
 @app.post("/analyze")
