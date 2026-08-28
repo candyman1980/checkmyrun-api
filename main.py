@@ -20,8 +20,8 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 MAX_IMAGE_SIDE = 1800
-GRID_COLS = 10
-GRID_ROWS = 20
+GRID_COLS = 14
+GRID_ROWS = 28
 GRID_CELLS = GRID_COLS * GRID_ROWS
 
 app = FastAPI(title="CheckMyRun")
@@ -132,11 +132,11 @@ ANALYSIS_SCHEMA = {
     },
 }
 
-ASSESSMENT_PROMPT = f"""Map visible running-shoe outsole wear at high spatial precision. You receive each untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all 10 cells of row 0 left-to-right, then row 1, through row 19. In the required capture position the rounded TOE is the far/top end of the guide (approximately rows 0-4) and the HEEL is the near/bottom end, usually nearest the hand (approximately rows 15-19). Verify this from the sole anatomy, and never place a heel finding in forefoot rows or a toe finding in heel rows.
+ASSESSMENT_PROMPT = f"""Map visible running-shoe outsole wear at high spatial precision. You receive each untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all {GRID_COLS} cells of row 0 left-to-right, then row 1, through row {GRID_ROWS - 1}. In the required capture position the rounded TOE is the far/top end of the guide (approximately rows 0-6) and the HEEL is the near/bottom end, usually nearest the hand (approximately rows 21-27). Verify this from the sole anatomy, and never place a heel finding in forefoot rows or a toe finding in heel rows.
 
-The definition of wear is rubber that has become abnormally smooth because manufactured surface texture has been erased or flattened. First inspect the TOE PAD and HEEL PAD separately on both shoes; these high-contact areas are commonly the clearest wear and must not be skipped. Then infer intended texture from faint surviving texture around a smooth area's edges, adjacent portions of the same continuous rubber pad, repeated blocks, the matching shoe, and symmetric parts of the same compound. Mark the interruption where expected fine texture fades or disappears, even when larger moulded contours remain.
+The governing rule is CONTINUITY OF MANUFACTURED TEXTURE. Across the sole, trace the man-made lines, ribs, contours, stippling and fine mould texture through every continuous rubber pad. Where that manufactured texture becomes faint, interrupted or absent without an intentional geometric boundary, the smooth gap is wear and must be highlighted. Infer the missing texture from the lines immediately before and after the gap, neighbouring parts of the same pad, repeated blocks, and the matching shoe. First inspect the TOE PAD and HEEL PAD separately; these high-contact areas must not be skipped. Mark the full smooth interruption, not merely its boundary.
 
-CRITICAL NEGATIVE RULE: visible man-made contours, grooves, ridges, ribs, tread lines, stippling, logos, mould seams and clean geometric edges must not themselves be coloured as wear. However, one or two surviving large contours do NOT make the surrounding rubber unworn when its finer texture has been polished away. Do not assume a broad toe or heel patch is factory-smooth merely because it is uniformly smooth. Call an area factory-smooth only when an intentional geometric boundary or consistent matching examples clearly support that conclusion. Exclude recessed foam/channels, dirt, shadows, glare, colour changes and photographic blur.
+CRITICAL DISTINCTION: visible man-made lines and contours are the reference pattern, not wear. Preserve them, but highlight the adjacent smooth rubber wherever the pattern that should continue no longer exists. A few surviving large contours do not make the surrounding rubber unworn when finer lines have disappeared. Default an unexplained smooth gap inside a patterned rubber pad to wear, not factory-smooth. Call it factory-smooth only when a crisp intentional boundary or repeated identical examples prove that design. Exclude recessed foam/channels, dirt, shadows, glare, colour changes and photographic blur.
 
 For every grid cell return 0 when outside rubber, uncertain, intentionally factory-smooth, or fine manufactured texture remains substantially intact; 1 when any meaningful part has credible local texture loss; 2 for clearly smooth/flattened rubber replacing expected texture; 3 for pronounced polished smoothness or material loss. A cell may be nonzero when only part is worn. Prefer sensitivity over omission once adjacent evidence establishes what texture should continue. Before finishing, perform a mandatory second visual sweep of the outer toe edge, central toe pad, outer heel edge and central heel pad and add every supported smooth interruption. The nine zone scores summarize the same evidence: 0 none, 1 light, 2 moderate, 3 heavy.
 
@@ -257,8 +257,8 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
     heat *= sole_mask(img, box).astype(np.float32) / 255.0
     colour = np.zeros_like(img)
     colour[:, :] = (24, 24, 238)
-    alpha = np.where(heat > 0.06, 0.12 + heat * 0.52, 0.0)
-    alpha = np.clip(alpha, 0, 0.64)[..., None]
+    alpha = np.where(heat > 0.045, 0.24 + heat * 0.56, 0.0)
+    alpha = np.clip(alpha, 0, 0.78)[..., None]
     composed = (img.astype(np.float32) * (1 - alpha) + colour.astype(np.float32) * alpha).astype(np.uint8)
     output = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(output)
@@ -269,7 +269,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "GPT5-ORIENTED-TOE-HEEL-V9"}
+    return {"ok": True, "marker": "TEXTURE-CONTINUITY-V10"}
 
 
 @app.post("/analyze")
