@@ -20,9 +20,6 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 MAX_IMAGE_SIDE = 1800
-GRID_COLS = 14
-GRID_ROWS = 28
-GRID_CELLS = GRID_COLS * GRID_ROWS
 GAVIOTA_5_REFERENCE_URL = "https://media.au.hoka.com/cdn-cgi/image/fit%3Dscale-down%2Cf%3Dauto%2Cw%3D1280/products/7f6b704b-e124-447f-a3e0-76de84263d5f/7ada0c6d/1134235-hmrg_hmrg_08.jpg"
 
 app = FastAPI(title="CheckMyRun")
@@ -110,7 +107,7 @@ ZONE_KEYS = [
 ANALYSIS_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["usable", "confidence", "left", "right", "left_grid", "right_grid", "comparison", "limitations"],
+    "required": ["usable", "confidence", "left", "right", "left_regions", "right_regions", "comparison", "limitations"],
     "properties": {
         "usable": {"type": "boolean"},
         "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -124,22 +121,60 @@ ANALYSIS_SCHEMA = {
             "required": ZONE_KEYS,
             "properties": {key: {"type": "integer", "minimum": 0, "maximum": 3} for key in ZONE_KEYS},
         },
-        "left_grid": {"type": "array", "minItems": GRID_CELLS, "maxItems": GRID_CELLS,
-                      "items": {"type": "integer", "minimum": 0, "maximum": 3}},
-        "right_grid": {"type": "array", "minItems": GRID_CELLS, "maxItems": GRID_CELLS,
-                       "items": {"type": "integer", "minimum": 0, "maximum": 3}},
+        "left_regions": {
+            "type": "array", "maxItems": 24,
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["intensity", "points"],
+                "properties": {
+                    "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "points": {
+                        "type": "array", "minItems": 3, "maxItems": 20,
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["x", "y"],
+                            "properties": {
+                                "x": {"type": "integer", "minimum": 0, "maximum": 1000},
+                                "y": {"type": "integer", "minimum": 0, "maximum": 1000},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "right_regions": {
+            "type": "array", "maxItems": 24,
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["intensity", "points"],
+                "properties": {
+                    "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "points": {
+                        "type": "array", "minItems": 3, "maxItems": 20,
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["x", "y"],
+                            "properties": {
+                                "x": {"type": "integer", "minimum": 0, "maximum": 1000},
+                                "y": {"type": "integer", "minimum": 0, "maximum": 1000},
+                            },
+                        },
+                    },
+                },
+            },
+        },
         "comparison": {"type": "string"},
         "limitations": {"type": "string"},
     },
 }
 
-ASSESSMENT_PROMPT = f"""Map visible Hoka Gaviota 5 outsole wear at high spatial precision. The first image is an UNWORN GAVIOTA 5 STRUCTURAL REFERENCE. Its colourway, lighting, scale and rotation are irrelevant. Use only its manufactured geometry: rubber-pad outlines, grooves, ribs, moulded lines, cut-outs and channels. After it, you receive each user's untouched full photograph followed by a tight {GRID_COLS}-column by {GRID_ROWS}-row location guide. Read the grid arrays row-major: all {GRID_COLS} cells of row 0 left-to-right, then row 1, through row {GRID_ROWS - 1}. In the required capture position the rounded TOE is the far/top end of the guide (approximately rows 0-6) and the HEEL is the near/bottom end, usually nearest the hand (approximately rows 21-27). Verify this from the sole anatomy, and never place a heel finding in forefoot rows or a toe finding in heel rows.
+ASSESSMENT_PROMPT = """Map visible Hoka Gaviota 5 outsole wear at high spatial precision. The first image is an UNWORN GAVIOTA 5 STRUCTURAL REFERENCE. Its colourway, lighting, scale and rotation are irrelevant. Use only its manufactured geometry: rubber-pad outlines, grooves, ribs, moulded lines, cut-outs and channels. After it, you receive each user's untouched full photograph followed by a tight sole crop with a light coordinate guide. Coordinates run 0..1000 within that crop: x from left to right and y from top to bottom. The rounded TOE is normally at the top and the HEEL nearest the hand at the bottom. Verify anatomy from pad geometry.
 
 First geometrically align the reference outsole to each user sole using pad outlines, channels and cut-outs—not colour. Then compare corresponding manufactured details. The governing rule is CONTINUITY OF MANUFACTURED TEXTURE. Trace the reference's man-made lines, ribs, contours, stippling and fine mould texture through every corresponding rubber pad. Where expected reference detail becomes faint, interrupted or absent in the user photo without an intentional boundary, the smooth gap is wear and must be highlighted. Confirm with neighbouring texture and the matching shoe. Inspect the TOE PAD and HEEL PAD separately; these high-contact areas must not be skipped. Mark the full smooth interruption, not merely its boundary.
 
 CRITICAL DISTINCTION: visible man-made lines and contours are the reference pattern, not wear. Preserve them, but highlight the adjacent smooth rubber wherever the pattern that should continue no longer exists. A few surviving large contours do not make the surrounding rubber unworn when finer lines have disappeared. Default an unexplained smooth gap inside a patterned rubber pad to wear, not factory-smooth. Call it factory-smooth only when a crisp intentional boundary or repeated identical examples prove that design. Exclude recessed foam/channels, dirt, shadows, glare, colour changes and photographic blur.
 
-For every grid cell return 0 when outside rubber, uncertain, intentionally factory-smooth, or fine manufactured texture remains substantially intact; 1 when any meaningful part has credible local texture loss; 2 for clearly smooth/flattened rubber replacing expected texture; 3 for pronounced polished smoothness or material loss. A cell may be nonzero when only part is worn. Prefer sensitivity over omission once adjacent evidence establishes what texture should continue. Before finishing, perform a mandatory second visual sweep of the outer toe edge, central toe pad, outer heel edge and central heel pad and add every supported smooth interruption. The nine zone scores summarize the same evidence: 0 none, 1 light, 2 moderate, 3 heavy.
+Return irregular polygon regions that closely trace the visible boundaries of smooth worn rubber. Use enough points to follow each natural patch; never return rectangles, grid cells or entire tread blocks when only part is worn. Polygon coordinates are 0..1000 in the tight coordinate-guide crop. Intensity 1 means light texture loss, 2 clearly smooth/flattened rubber, and 3 pronounced polishing or material loss. Adjacent wear with the same intensity should be one organic region. Prefer sensitivity over omission once surrounding or reference detail proves what texture should continue. Before finishing, perform a mandatory second sweep of the outer toe, central toe pad, outer heel and central heel and add every supported smooth interruption. The nine zone scores summarize the same evidence: 0 none, 1 light, 2 moderate, 3 heavy.
 
 Set usable=false and confidence below 35 if either sole is incomplete, strongly oblique, blurred, glared, or the original design cannot be inferred. Confidence measures photographic evidence only. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
 
@@ -153,18 +188,13 @@ def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str
         crop = img.copy()
     if with_grid:
         ch, cw = crop.shape[:2]
-        for index in range(1, GRID_COLS):
-            x = round(cw * index / GRID_COLS)
-            cv2.line(crop, (x, 0), (x, ch), (255, 255, 255), max(1, cw // 500))
-        for index in range(1, GRID_ROWS):
-            y = round(ch * index / GRID_ROWS)
-            cv2.line(crop, (0, y), (cw, y), (255, 255, 255), max(1, cw // 500))
-        for row in range(GRID_ROWS):
-            for col in range(GRID_COLS):
-                label = f"{row:02d},{col}"
-                origin = (round(cw * col / GRID_COLS) + 2, round(ch * row / GRID_ROWS) + 12)
-                cv2.putText(crop, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(crop, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1, cv2.LINE_AA)
+        for index in range(1, 10):
+            x = round(cw * index / 10)
+            y = round(ch * index / 10)
+            cv2.line(crop, (x, 0), (x, ch), (255, 255, 255), 1)
+            cv2.line(crop, (0, y), (cw, y), (255, 255, 255), 1)
+            cv2.putText(crop, str(index * 100), (x + 2, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (20, 20, 20), 2, cv2.LINE_AA)
+            cv2.putText(crop, str(index * 100), (2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (20, 20, 20), 2, cv2.LINE_AA)
     ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 94])
     if not ok:
         raise ValueError("Could not prepare the sole crop")
@@ -248,65 +278,38 @@ def sole_mask(img: np.ndarray, box):
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
-def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
+def overlay_heatmap(img: np.ndarray, box, regions):
     h, w = img.shape[:2]
     x1, y1, x2, y2 = box
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
     box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
-    coarse = np.asarray(grid_values, dtype=np.float32).reshape(GRID_ROWS, GRID_COLS) / 3.0
-    heel_score = max(zones["heel_lateral"], zones["heel_central"], zones["heel_medial"])
-    if heel_score > 0:
-        # The required photo position fixes heel at the bottom. Reinforce the
-        # anatomical outer heel when the zonal verdict and dense map disagree.
-        lateral_cols = range(0, 4) if side == "left" else range(GRID_COLS - 4, GRID_COLS)
-        target = float(heel_score) / 3.0
-        for row in range(GRID_ROWS - 4, GRID_ROWS - 1):
-            for col in lateral_cols:
-                distance = abs(row - (GRID_ROWS - 3)) / 2.2 + abs(col - (1.5 if side == "left" else GRID_COLS - 2.5)) / 2.8
-                if distance < 1.0:
-                    coarse[row, col] = max(coarse[row, col], target * (1.0 - distance * 0.45))
-    cell_w, cell_h = box_w / GRID_COLS, box_h / GRID_ROWS
-
-    # Render each positive cell as a soft evidence centre. Adjacent centres merge
-    # naturally into irregular wear zones instead of exposing the analysis grid.
-    mapped = np.zeros((box_h, box_w), np.float32)
-    for row in range(GRID_ROWS):
-        for col in range(GRID_COLS):
-            strength = float(coarse[row, col])
-            if strength <= 0:
-                continue
-            centre = (round((col + 0.5) * cell_w), round((row + 0.5) * cell_h))
-            axes = (max(3, round(cell_w * 0.85)), max(3, round(cell_h * 0.85)))
-            cv2.ellipse(mapped, centre, axes, 0, 0, 360, strength, -1, cv2.LINE_AA)
-    mapped = cv2.GaussianBlur(
-        mapped, (0, 0),
-        sigmaX=max(3, cell_w * 0.72),
-        sigmaY=max(3, cell_h * 0.72),
-    )
-
-    # Visible ribs/grooves mean tread is still present. Attenuate model evidence
-    # over locally edge-rich rubber while retaining it over smooth polished areas.
-    crop_gray = cv2.cvtColor(img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)], cv2.COLOR_BGR2GRAY)
-    if crop_gray.shape == mapped.shape:
-        gx = cv2.Sobel(crop_gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(crop_gray, cv2.CV_32F, 0, 1, ksize=3)
-        edge_density = cv2.GaussianBlur(
-            cv2.magnitude(gx, gy), (0, 0),
-            sigmaX=max(2, cell_w * 0.38),
-            sigmaY=max(2, cell_h * 0.38),
-        )
-        low, high = np.percentile(edge_density, (25, 78))
-        if high > low + 0.01:
-            smoothness = 1.0 - np.clip((edge_density - low) / (high - low), 0, 1)
-            mapped *= 0.06 + 0.94 * np.power(smoothness, 1.55)
     heat = np.zeros((h, w), np.float32)
-    heat[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = np.clip(mapped, 0, 1)[:min(h, y2)-max(0, y1), :min(w, x2)-max(0, x1)]
+
+    # Each model-drawn polygon becomes a feathered patch. The maximum operation
+    # preserves severity where regions overlap without exposing artificial grids.
+    for region in regions:
+        points = region.get("points", [])
+        if len(points) < 3:
+            continue
+        polygon = np.asarray([
+            [x1 + round(float(point["x"]) * box_w / 1000),
+             y1 + round(float(point["y"]) * box_h / 1000)]
+            for point in points
+        ], dtype=np.int32)
+        region_mask = np.zeros((h, w), np.float32)
+        cv2.fillPoly(region_mask, [polygon], 1.0, cv2.LINE_AA)
+        feather = max(3.0, min(box_w, box_h) * 0.009)
+        region_mask = cv2.GaussianBlur(region_mask, (0, 0), feather)
+        strength = {1: 0.42, 2: 0.70, 3: 1.0}.get(int(region.get("intensity", 1)), 0.42)
+        heat = np.maximum(heat, region_mask * strength)
+
     heat *= sole_mask(img, box).astype(np.float32) / 255.0
     colour = np.zeros_like(img)
     colour[:, :] = (24, 24, 238)
     # Continuous opacity avoids rectangular threshold edges. Only negligible haze
     # is removed; credible evidence remains clearly visible.
-    alpha = np.clip(heat * 1.58, 0, 0.76)
-    alpha[alpha < 0.035] = 0
+    alpha = np.clip(heat * 0.82, 0, 0.78)
+    alpha[alpha < 0.025] = 0
     alpha = alpha[..., None]
     composed = (img.astype(np.float32) * (1 - alpha) + colour.astype(np.float32) * alpha).astype(np.uint8)
     output = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
@@ -318,7 +321,7 @@ def overlay_heatmap(img: np.ndarray, box, grid_values, zones, side):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "GAVIOTA5-REFERENCE-V15"}
+    return {"ok": True, "marker": "DIRECT-CONTOURS-V16"}
 
 
 @app.post("/analyze")
@@ -340,8 +343,8 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
                 "assessment": assessment,
             }, status_code=422)
         return {
-            "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_grid"], assessment["left"], "left"),
-            "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_grid"], assessment["right"], "right"),
+            "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_regions"]),
+            "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_regions"]),
             "assessment": assessment,
             "quality": {
                 "left": {"crop_method": left_method, "detection_confidence": left_detection},
