@@ -122,14 +122,14 @@ ANALYSIS_SCHEMA = {
             "properties": {key: {"type": "integer", "minimum": 0, "maximum": 3} for key in ZONE_KEYS},
         },
         "left_regions": {
-            "type": "array", "maxItems": 24,
+            "type": "array", "maxItems": 14,
             "items": {
                 "type": "object", "additionalProperties": False,
                 "required": ["intensity", "points"],
                 "properties": {
                     "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
                     "points": {
-                        "type": "array", "minItems": 3, "maxItems": 20,
+                        "type": "array", "minItems": 3, "maxItems": 14,
                         "items": {
                             "type": "object", "additionalProperties": False,
                             "required": ["x", "y"],
@@ -143,14 +143,14 @@ ANALYSIS_SCHEMA = {
             },
         },
         "right_regions": {
-            "type": "array", "maxItems": 24,
+            "type": "array", "maxItems": 14,
             "items": {
                 "type": "object", "additionalProperties": False,
                 "required": ["intensity", "points"],
                 "properties": {
                     "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
                     "points": {
-                        "type": "array", "minItems": 3, "maxItems": 20,
+                        "type": "array", "minItems": 3, "maxItems": 14,
                         "items": {
                             "type": "object", "additionalProperties": False,
                             "required": ["x", "y"],
@@ -181,6 +181,16 @@ Return irregular polygon regions that closely trace the visible boundaries of sm
 MANDATORY HEEL CHECK: identify the lowest broad ground-contacting heel pad in each user crop and its matching unworn reference pad. Trace every area where the reference's fine parallel lines or mould texture has disappeared. If the zonal heel score is nonzero, at least one returned heel polygon must cover that same evidence on the bottom heel pad—not a midfoot pad or a channel above it. Repeat this check for the outer and central toe contact pads. Finally reject or trim any polygon that touches recessed foam or crosses a manufactured pad boundary. The nine zone scores summarize the same evidence: 0 none, 1 light, 2 moderate, 3 heavy.
 
 Set usable=false and confidence below 35 if either sole is incomplete, strongly oblique, blurred, glared, or the original design cannot be inferred. Confidence measures photographic evidence only. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
+
+GENERIC_ASSESSMENT_PROMPT = """Inspect the two running-shoe outsole photographs for visible rubber wear. This must work for any brand, model and colourway. Never reject a clear photograph merely because the shoe model is unfamiliar.
+
+Wear means local loss of manufactured tread detail: ribs, grooves, stippling, mould texture or sharp lug edges become smoother, shallower, rounded or absent. Infer the intended pattern from repeated neighbouring elements, continuity across each rubber pad, and comparison between the left and right shoe. Existing crisp man-made lines are NOT wear. Do not confuse dirt, shadows, glare, colour, recessed channels, exposed midsole or deliberately smooth panels with wear.
+
+Return organic polygon regions around only visually supported worn rubber. Coordinates are 0..1000 in each tight coordinate-guide crop: x from left to right and y from top/toe to bottom/heel. Every polygon must stay on one raised ground-contacting rubber pad. Never cross pad outlines or include background, hand, foam, channels, grooves, holes, trenches or pad sidewalls. Split disconnected worn areas into separate polygons. Intensity 1 means subtle smoothing, 2 clear loss of texture, and 3 severe flattening or material loss.
+
+Inspect the entire outer and central toe pads and the entire outer and central heel pads twice before finishing; these high-contact areas are commonly missed. Prefer sensitivity once neighbouring detail proves that manufactured texture should continue, but do not paint intact patterned rubber. The nine zone scores summarize the same evidence from 0 none to 3 heavy.
+
+Set usable=false and confidence below 35 only if either sole is incomplete, strongly oblique, badly blurred or obscured by glare. Confidence measures photographic evidence only. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
 
 
 def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str:
@@ -221,13 +231,13 @@ def request_assessment(content) -> Dict:
                 "schema": ANALYSIS_SCHEMA,
             }
         },
-        "max_output_tokens": 8000,
+        "max_output_tokens": 12000,
     }
     response = httpx.post(
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
         json=payload,
-        timeout=90,
+        timeout=150,
     )
     if response.status_code >= 400:
         detail = response.json().get("error", {}).get("message", "Visual assessment request failed")
@@ -247,8 +257,7 @@ def request_assessment(content) -> Dict:
 
 def assess_zones(left_original: str, left_grid: str, right_original: str, right_grid: str) -> Dict:
     images = [
-        {"type": "input_text", "text": ASSESSMENT_PROMPT + "\n\nUNWORN HOKA GAVIOTA 5 — STRUCTURAL REFERENCE"},
-        {"type": "input_image", "image_url": GAVIOTA_5_REFERENCE_URL, "detail": "high"},
+        {"type": "input_text", "text": GENERIC_ASSESSMENT_PROMPT},
         {"type": "input_text", "text": "LEFT SHOE — UNTOUCHED FULL PHOTOGRAPH"},
         {"type": "input_image", "image_url": left_original, "detail": "high"},
         {"type": "input_text", "text": "LEFT SHOE — LOCATION GUIDE ONLY"},
@@ -325,7 +334,7 @@ def overlay_heatmap(img: np.ndarray, box, regions):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "DIRECT-CONTOURS-V16"}
+    return {"ok": True, "marker": "GENERIC-CONTOURS-V17"}
 
 
 @app.post("/analyze")
