@@ -82,6 +82,12 @@ def background_box(img: np.ndarray):
 
 def locate_sole(img: np.ndarray):
     h, w = img.shape[:2]
+    def padded(box):
+        x1, y1, x2, y2 = box
+        pad_x = round((x2 - x1) * 0.025)
+        pad_y = round((y2 - y1) * 0.025)
+        return (max(0, x1 - pad_x), max(0, y1 - pad_y), min(w, x2 + pad_x), min(h, y2 + pad_y))
+
     try:
         result = get_yolo_world().predict(img, imgsz=960, conf=0.06, verbose=False)[0]
         if result.boxes is not None and len(result.boxes) > 0:
@@ -89,12 +95,12 @@ def locate_sole(img: np.ndarray):
             confidence = result.boxes.conf.cpu().numpy()
             index = int(np.argmax(confidence))
             x1, y1, x2, y2 = map(int, boxes[index])
-            return (x1, y1, x2, y2), "object_detector", round(float(confidence[index]), 3)
+            return padded((x1, y1, x2, y2)), "object_detector", round(float(confidence[index]), 3)
     except Exception:
         pass
     fallback = background_box(img)
     if fallback:
-        return fallback, "background_segmentation", None
+        return padded(fallback), "background_segmentation", None
     return (0, 0, w, h), "full_image_fallback", None
 
 
@@ -122,14 +128,14 @@ ANALYSIS_SCHEMA = {
             "properties": {key: {"type": "integer", "minimum": 0, "maximum": 3} for key in ZONE_KEYS},
         },
         "left_regions": {
-            "type": "array", "maxItems": 14,
+            "type": "array", "maxItems": 36,
             "items": {
                 "type": "object", "additionalProperties": False,
                 "required": ["intensity", "points"],
                 "properties": {
                     "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
                     "points": {
-                        "type": "array", "minItems": 3, "maxItems": 14,
+                        "type": "array", "minItems": 3, "maxItems": 24,
                         "items": {
                             "type": "object", "additionalProperties": False,
                             "required": ["x", "y"],
@@ -143,14 +149,14 @@ ANALYSIS_SCHEMA = {
             },
         },
         "right_regions": {
-            "type": "array", "maxItems": 14,
+            "type": "array", "maxItems": 36,
             "items": {
                 "type": "object", "additionalProperties": False,
                 "required": ["intensity", "points"],
                 "properties": {
                     "intensity": {"type": "integer", "minimum": 1, "maximum": 3},
                     "points": {
-                        "type": "array", "minItems": 3, "maxItems": 14,
+                        "type": "array", "minItems": 3, "maxItems": 24,
                         "items": {
                             "type": "object", "additionalProperties": False,
                             "required": ["x", "y"],
@@ -188,7 +194,7 @@ Wear means local loss of manufactured tread detail: ribs, grooves, stippling, mo
 
 Return organic polygon regions around only visually supported worn rubber. Coordinates are 0..1000 in each tight coordinate-guide crop: x from left to right and y from top/toe to bottom/heel. Every polygon must stay on one raised ground-contacting rubber pad. Never cross pad outlines or include background, hand, foam, channels, grooves, holes, trenches or pad sidewalls. Split disconnected worn areas into separate polygons. Intensity 1 means subtle smoothing, 2 clear loss of texture, and 3 severe flattening or material loss.
 
-Inspect the entire outer and central toe pads and the entire outer and central heel pads twice before finishing; these high-contact areas are commonly missed. Prefer sensitivity once neighbouring detail proves that manufactured texture should continue, but do not paint intact patterned rubber. The nine zone scores summarize the same evidence from 0 none to 3 heavy.
+Work methodically from toe to heel, pad by pad. On every raised rubber pad, compare each subsection with repeated neighbouring tread and the matching shoe; return a separate organic region for every supported smooth interruption. Do not stop after finding the largest or most obvious patches. Inspect the entire outer and central toe pads and the entire outer and central heel pads twice before finishing; these high-contact areas are commonly missed. A broad smooth area with only a few surviving grooves is still worn where the finer manufactured texture has disappeared. Prefer sensitivity once neighbouring detail proves that manufactured texture should continue, but do not paint intact patterned rubber. The nine zone scores summarize the same evidence from 0 none to 3 heavy.
 
 Set usable=false and confidence below 35 only if either sole is incomplete, strongly oblique, badly blurred or obscured by glare. Confidence measures photographic evidence only. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
 
@@ -231,7 +237,7 @@ def request_assessment(content) -> Dict:
                 "schema": ANALYSIS_SCHEMA,
             }
         },
-        "max_output_tokens": 12000,
+        "max_output_tokens": 18000,
     }
     response = httpx.post(
         "https://api.openai.com/v1/responses",
@@ -316,7 +322,18 @@ def overlay_heatmap(img: np.ndarray, box, regions):
         strength = {1: 0.42, 2: 0.70, 3: 1.0}.get(int(region.get("intensity", 1)), 0.42)
         heat = np.maximum(heat, region_mask * strength)
 
-    heat *= sole_mask(img, box).astype(np.float32) / 255.0
+    # Feather the sole boundary too. Multiplying a blurred heat region by the old
+    # binary mask produced an artificial straight cutoff when segmentation ended
+    # just before a rounded toe or heel.
+    mask = sole_mask(img, box)
+    edge_pad = max(9, round(min(box_w, box_h) * 0.025))
+    if edge_pad % 2 == 0:
+        edge_pad += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (edge_pad, edge_pad))
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask_feather = max(4.0, min(box_w, box_h) * 0.012)
+    soft_mask = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), mask_feather)
+    heat *= soft_mask
     colour = np.zeros_like(img)
     colour[:, :] = (24, 24, 238)
     # Continuous opacity avoids rectangular threshold edges. Only negligible haze
@@ -334,7 +351,7 @@ def overlay_heatmap(img: np.ndarray, box, regions):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "GENERIC-CONTOURS-V17"}
+    return {"ok": True, "marker": "GENERIC-CONTOURS-V18"}
 
 
 @app.post("/analyze")
