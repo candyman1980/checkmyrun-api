@@ -20,7 +20,7 @@ from ultralytics import YOLOWorld
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst")
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2")
 MAX_IMAGE_SIDE = 1800
 GAVIOTA_5_REFERENCE_URL = "https://media.au.hoka.com/cdn-cgi/image/fit%3Dscale-down%2Cf%3Dauto%2Cw%3D1280/products/7f6b704b-e124-447f-a3e0-76de84263d5f/7ada0c6d/1134235-hmrg_hmrg_08.jpg"
 EXAMPLE_DIR = Path(__file__).resolve().parent / "examples"
@@ -231,7 +231,6 @@ def request_direct_heatmap(jpeg: bytes) -> str:
             "model": OPENAI_IMAGE_MODEL,
             "prompt": DIRECT_HEATMAP_PROMPT,
             "quality": "high",
-            "input_fidelity": "high",
             "size": "auto",
             "output_format": "png",
         },
