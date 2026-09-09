@@ -3,6 +3,7 @@ import io
 import json
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Tuple
 
 import cv2
@@ -21,6 +22,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 MAX_IMAGE_SIDE = 1800
 GAVIOTA_5_REFERENCE_URL = "https://media.au.hoka.com/cdn-cgi/image/fit%3Dscale-down%2Cf%3Dauto%2Cw%3D1280/products/7f6b704b-e124-447f-a3e0-76de84263d5f/7ada0c6d/1134235-hmrg_hmrg_08.jpg"
+EXAMPLE_DIR = Path(__file__).resolve().parent / "examples"
 
 app = FastAPI(title="CheckMyRun")
 app.add_middleware(
@@ -56,6 +58,11 @@ def prepare_image(raw: bytes) -> Tuple[bytes, np.ndarray]:
 
 def image_data_url(jpeg: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()
+
+
+@lru_cache(maxsize=8)
+def example_data_url(filename: str) -> str:
+    return image_data_url((EXAMPLE_DIR / filename).read_bytes())
 
 
 def background_box(img: np.ndarray):
@@ -190,6 +197,8 @@ Set usable=false and confidence below 35 if either sole is incomplete, strongly 
 
 GENERIC_ASSESSMENT_PROMPT = """Inspect the two running-shoe outsole photographs for visible rubber wear. This must work for any brand, model and colourway. Never reject a clear photograph merely because the shoe model is unfamiliar.
 
+Before the user photographs you receive two labelled teaching examples. Each CLEAN EXAMPLE is followed by the same sole manually corrected by a human. The translucent red in the CORRECTED EXAMPLE is the desired wear evidence: it deliberately covers broad areas where fine manufactured tread has disappeared, not merely isolated points. Learn the visual distinction and coverage style from these examples. The teaching examples guide interpretation only; return coordinates for the user's subsequent photographs.
+
 Wear means local loss of manufactured tread detail: ribs, grooves, stippling, mould texture or sharp lug edges become smoother, shallower, rounded or absent. Infer the intended pattern from repeated neighbouring elements, continuity across each rubber pad, and comparison between the left and right shoe. Existing crisp man-made lines are NOT wear. Do not confuse dirt, shadows, glare, colour, recessed channels, exposed midsole or deliberately smooth panels with wear.
 
 Return organic polygon regions around only visually supported worn rubber. Coordinates are 0..1000 in each tight coordinate-guide crop: x from left to right and y from top/toe to bottom/heel. Every polygon must stay on one raised ground-contacting rubber pad. Never cross pad outlines or include background, hand, foam, channels, grooves, holes, trenches or pad sidewalls. Split disconnected worn areas into separate polygons. Intensity 1 means subtle smoothing, 2 clear loss of texture, and 3 severe flattening or material loss.
@@ -264,6 +273,14 @@ def request_assessment(content) -> Dict:
 def assess_zones(left_original: str, left_grid: str, right_original: str, right_grid: str) -> Dict:
     images = [
         {"type": "input_text", "text": GENERIC_ASSESSMENT_PROMPT},
+        {"type": "input_text", "text": "TEACHING EXAMPLE — CLEAN LEFT SOLE"},
+        {"type": "input_image", "image_url": example_data_url("hoka_left_original.jpg"), "detail": "high"},
+        {"type": "input_text", "text": "TEACHING EXAMPLE — HUMAN-CORRECTED LEFT SOLE (red areas are the wear target)"},
+        {"type": "input_image", "image_url": example_data_url("hoka_left_labelled.jpg"), "detail": "high"},
+        {"type": "input_text", "text": "TEACHING EXAMPLE — CLEAN RIGHT SOLE"},
+        {"type": "input_image", "image_url": example_data_url("hoka_right_original.jpg"), "detail": "high"},
+        {"type": "input_text", "text": "TEACHING EXAMPLE — HUMAN-CORRECTED RIGHT SOLE (red areas are the wear target)"},
+        {"type": "input_image", "image_url": example_data_url("hoka_right_labelled.jpg"), "detail": "high"},
         {"type": "input_text", "text": "LEFT SHOE — UNTOUCHED FULL PHOTOGRAPH"},
         {"type": "input_image", "image_url": left_original, "detail": "high"},
         {"type": "input_text", "text": "LEFT SHOE — LOCATION GUIDE ONLY"},
@@ -351,7 +368,7 @@ def overlay_heatmap(img: np.ndarray, box, regions):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "GENERIC-CONTOURS-V18"}
+    return {"ok": True, "marker": "LABELLED-EXAMPLE-V19"}
 
 
 @app.post("/analyze")
