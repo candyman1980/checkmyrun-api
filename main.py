@@ -20,6 +20,7 @@ from ultralytics import YOLOWorld
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst")
 MAX_IMAGE_SIDE = 1800
 GAVIOTA_5_REFERENCE_URL = "https://media.au.hoka.com/cdn-cgi/image/fit%3Dscale-down%2Cf%3Dauto%2Cw%3D1280/products/7f6b704b-e124-447f-a3e0-76de84263d5f/7ada0c6d/1134235-hmrg_hmrg_08.jpg"
 EXAMPLE_DIR = Path(__file__).resolve().parent / "examples"
@@ -207,6 +208,47 @@ Work methodically from toe to heel, pad by pad. On every raised rubber pad, comp
 
 Set usable=false and confidence below 35 only if either sole is incomplete, strongly oblique, badly blurred or obscured by glare. Confidence measures photographic evidence only. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
 
+DIRECT_HEATMAP_PROMPT = """Edit this exact shoe-sole photograph into a diagnostic wear-overlay image.
+
+Preserve the photograph, shoe, perspective, crop, lighting, colours, tread geometry and background exactly. Do not redraw, beautify, repair, rotate, crop or replace anything. The only permitted change is a translucent RED heatmap painted over genuinely worn ground-contacting outsole rubber.
+
+Wear means manufactured surface detail has been abraded away: expected fine ribs, grooves, stippling, mould texture or sharp lug edges have become smooth, faint, rounded or absent. Infer what should exist by following repeated tread elements, neighbouring parts of the same rubber pad, left/right symmetry within the design, and continuity of man-made lines. Visible crisp manufactured lines and contours mean tread remains and must not be highlighted. Dirt, shadows, glare and colour differences are not wear.
+
+Inspect every raised contact pad from the very front toe to the very back heel. Toe and heel are high-contact areas and must be checked especially carefully. Highlight the full smooth worn patch, including broad smooth areas where only a few larger grooves survive. Do not mark intact textured rubber.
+
+The overlay must stay strictly inside raised rubber surfaces. Never paint the background, hand, midsole foam, recessed channels, flex grooves, holes, cut-outs, trenches, pad sidewalls, logos or decorative inserts. Stop naturally at each rubber-pad boundary. Separate disconnected areas.
+
+Render the result as soft organic heatmap blobs, never boxes or straight-edged blocks. Use only red: faint transparent red for light smoothing, stronger transparent red for clear texture loss, and deepest transparent red for severe flattening. Keep enough transparency that the original tread remains clearly visible beneath it. Add no labels, arrows, outlines, legends, text or other graphics."""
+
+
+def request_direct_heatmap(jpeg: bytes) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("The image-editing service is not configured")
+    response = httpx.post(
+        "https://api.openai.com/v1/images/edits",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        data={
+            "model": OPENAI_IMAGE_MODEL,
+            "prompt": DIRECT_HEATMAP_PROMPT,
+            "quality": "high",
+            "input_fidelity": "high",
+            "size": "auto",
+            "output_format": "png",
+        },
+        files=[("image[]", ("sole.jpg", jpeg, "image/jpeg"))],
+        timeout=300,
+    )
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("error", {}).get("message", "Direct heatmap request failed")
+        except Exception:
+            detail = "Direct heatmap request failed"
+        raise RuntimeError(detail)
+    images = response.json().get("data", [])
+    if not images or not images[0].get("b64_json"):
+        raise RuntimeError("The image editor returned no image")
+    return "data:image/png;base64," + images[0]["b64_json"]
+
 
 def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str:
     h, w = img.shape[:2]
@@ -368,7 +410,21 @@ def overlay_heatmap(img: np.ndarray, box, regions):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "marker": "LABELLED-EXAMPLE-V19"}
+    return {"ok": True, "marker": "DIRECT-IMAGE-EDIT-V20"}
+
+
+@app.post("/analyze-edit")
+async def analyze_edit(shoe: UploadFile = File(...)):
+    """Experimental single-sole heatmap using direct AI image editing."""
+    try:
+        jpeg, _ = prepare_image(await shoe.read())
+        return {
+            "heatmap_data_url": request_direct_heatmap(jpeg),
+            "experimental": True,
+            "model": OPENAI_IMAGE_MODEL,
+        }
+    except Exception as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=500)
 
 
 @app.post("/analyze")
