@@ -20,6 +20,7 @@ from ultralytics import YOLOWorld
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-5.5")
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2")
 MAX_IMAGE_SIDE = 1800
 GAVIOTA_5_REFERENCE_URL = "https://media.au.hoka.com/cdn-cgi/image/fit%3Dscale-down%2Cf%3Dauto%2Cw%3D1280/products/7f6b704b-e124-447f-a3e0-76de84263d5f/7ada0c6d/1134235-hmrg_hmrg_08.jpg"
@@ -208,6 +209,16 @@ Work methodically from toe to heel, pad by pad. On every raised rubber pad, comp
 
 Set usable=false and confidence below 35 only if either sole is incomplete, strongly oblique, badly blurred or obscured by glare. Confidence measures photographic evidence only. Do not diagnose gait, pronation, supination, injury risk or a medical condition."""
 
+VISION_V2_PROMPT = """Find worn rubber on these two shoe outsoles.
+
+Worn rubber is a raised ground-contacting area where the original manufactured surface detail has been rubbed away. Look for locally smooth, polished or flattened patches where nearby repeated ribs, grooves, stippling, mould texture or sharp lug edges show what should have continued. Existing crisp manufactured lines are intact tread, not wear. Colour is irrelevant: do not select an area merely because it is green, red, black, dirty, light or dark.
+
+Inspect every contact pad from the toe to the heel. Pay particular attention to broad toe and heel patches where fine texture is gone even if a few deep grooves remain. Compare repeated elements within each shoe and corresponding areas across the pair. Do not mark factory-smooth recesses, foam, channels, flex grooves, holes, logos, pad sidewalls, dirt, glare, shadows, the hand or the background.
+
+For each shoe, return organic polygons around all visually supported worn patches. Coordinates are 0..1000 within that shoe's clean tight crop: x is left-to-right and y is top-to-bottom. Keep every polygon inside one continuous raised rubber contact surface and split it at pad boundaries. Intensity 1 is subtle smoothing, 2 is clear texture loss and 3 is severe flattening or material loss. Prefer complete coverage of genuine smooth patches over a few token marks, but do not paint intact tread.
+
+The accompanying full photographs provide context only. Base coordinates on the clean tight crops. Set usable=false only if the photographs genuinely prevent inspection. Confidence measures the visibility of wear evidence. Do not diagnose gait or make medical claims."""
+
 DIRECT_HEATMAP_PROMPT = """Edit this exact shoe-sole photograph into a diagnostic wear-overlay image.
 
 Preserve the photograph, shoe, perspective, crop, lighting, colours, tread geometry and background exactly. Do not redraw, beautify, repair, rotate, crop or replace anything. The only permitted change is a translucent RED heatmap painted over genuinely worn ground-contacting outsole rubber.
@@ -272,13 +283,13 @@ def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str
     return "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode()
 
 
-def request_assessment(content) -> Dict:
+def request_assessment(content, model: str = None, reasoning_effort: str = "medium") -> Dict:
     if not OPENAI_API_KEY:
         raise RuntimeError("The visual assessment service is not configured")
     payload = {
-        "model": OPENAI_MODEL,
+        "model": model or OPENAI_MODEL,
         "store": False,
-        "reasoning": {"effort": "medium"},
+        "reasoning": {"effort": reasoning_effort},
         "input": [{"role": "user", "content": content}],
         "text": {
             "format": {
@@ -333,6 +344,22 @@ def assess_zones(left_original: str, left_grid: str, right_original: str, right_
         {"type": "input_image", "image_url": right_grid, "detail": "high"},
     ]
     return request_assessment(images)
+
+
+def assess_zones_v2(left_original: str, left_crop: str, right_original: str, right_crop: str) -> Dict:
+    """Higher-fidelity comparison without grids or colour-biased examples."""
+    content = [
+        {"type": "input_text", "text": VISION_V2_PROMPT},
+        {"type": "input_text", "text": "LEFT SHOE — FULL PHOTOGRAPH (context only)"},
+        {"type": "input_image", "image_url": left_original, "detail": "original"},
+        {"type": "input_text", "text": "LEFT SHOE — CLEAN TIGHT CROP (return left coordinates for this image)"},
+        {"type": "input_image", "image_url": left_crop, "detail": "original"},
+        {"type": "input_text", "text": "RIGHT SHOE — FULL PHOTOGRAPH (context only)"},
+        {"type": "input_image", "image_url": right_original, "detail": "original"},
+        {"type": "input_text", "text": "RIGHT SHOE — CLEAN TIGHT CROP (return right coordinates for this image)"},
+        {"type": "input_image", "image_url": right_crop, "detail": "original"},
+    ]
+    return request_assessment(content, model=OPENAI_VISION_MODEL, reasoning_effort="high")
 
 
 def sole_mask(img: np.ndarray, box):
@@ -449,6 +476,41 @@ async def analyze(left: UploadFile = File(...), right: UploadFile = File(...)):
             "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_regions"]),
             "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_regions"]),
             "assessment": assessment,
+            "quality": {
+                "left": {"crop_method": left_method, "detection_confidence": left_detection},
+                "right": {"crop_method": right_method, "detection_confidence": right_detection},
+            },
+        }
+    except Exception as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=500)
+
+
+@app.post("/analyze-v2")
+async def analyze_v2(left: UploadFile = File(...), right: UploadFile = File(...)):
+    """Isolated high-fidelity vision test; the production analyser stays unchanged."""
+    try:
+        left_jpeg, left_img = prepare_image(await left.read())
+        right_jpeg, right_img = prepare_image(await right.read())
+        left_box, left_method, left_detection = locate_sole(left_img)
+        right_box, right_method, right_detection = locate_sole(right_img)
+        assessment = assess_zones_v2(
+            image_data_url(left_jpeg),
+            analysis_crop_data_url(left_img, left_box),
+            image_data_url(right_jpeg),
+            analysis_crop_data_url(right_img, right_box),
+        )
+        if not assessment["usable"]:
+            return JSONResponse({
+                "detail": "These photographs do not show enough reliable tread detail for an assessment.",
+                "assessment": assessment,
+                "model": OPENAI_VISION_MODEL,
+            }, status_code=422)
+        return {
+            "left_heatmap_data_url": overlay_heatmap(left_img, left_box, assessment["left_regions"]),
+            "right_heatmap_data_url": overlay_heatmap(right_img, right_box, assessment["right_regions"]),
+            "assessment": assessment,
+            "model": OPENAI_VISION_MODEL,
+            "experimental": True,
             "quality": {
                 "left": {"crop_method": left_method, "detection_confidence": left_detection},
                 "right": {"crop_method": right_method, "detection_confidence": right_detection},
