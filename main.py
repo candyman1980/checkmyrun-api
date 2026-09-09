@@ -230,9 +230,10 @@ def request_direct_heatmap(jpeg: bytes) -> str:
         data={
             "model": OPENAI_IMAGE_MODEL,
             "prompt": DIRECT_HEATMAP_PROMPT,
-            "quality": "high",
-            "size": "auto",
-            "output_format": "png",
+            "quality": "medium",
+            "size": "1024x1536",
+            "output_format": "jpeg",
+            "output_compression": "82",
         },
         files=[("image[]", ("sole.jpg", jpeg, "image/jpeg"))],
         timeout=300,
@@ -246,7 +247,7 @@ def request_direct_heatmap(jpeg: bytes) -> str:
     images = response.json().get("data", [])
     if not images or not images[0].get("b64_json"):
         raise RuntimeError("The image editor returned no image")
-    return "data:image/png;base64," + images[0]["b64_json"]
+    return "data:image/jpeg;base64," + images[0]["b64_json"]
 
 
 def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str:
