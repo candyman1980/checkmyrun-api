@@ -21,6 +21,7 @@ from ultralytics import YOLOWorld
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-5.5")
+OPENAI_ASTRA_MODEL = os.getenv("OPENAI_ASTRA_MODEL", "gpt-6-astra")
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2")
 MAX_IMAGE_SIDE = 1800
 GAVIOTA_5_REFERENCE_URL = "https://media.au.hoka.com/cdn-cgi/image/fit%3Dscale-down%2Cf%3Dauto%2Cw%3D1280/products/7f6b704b-e124-447f-a3e0-76de84263d5f/7ada0c6d/1134235-hmrg_hmrg_08.jpg"
@@ -42,14 +43,14 @@ def get_yolo_world():
     return model
 
 
-def prepare_image(raw: bytes) -> Tuple[bytes, np.ndarray]:
+def prepare_image(raw: bytes, max_side: int = MAX_IMAGE_SIDE) -> Tuple[bytes, np.ndarray]:
     try:
         pil = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     except Exception as exc:
         raise ValueError("The uploaded file is not a readable photograph") from exc
     if min(pil.size) < 400:
         raise ValueError("Photo resolution is too low; use an image at least 400 pixels wide and high")
-    scale = min(1.0, MAX_IMAGE_SIDE / max(pil.size))
+    scale = min(1.0, max_side / max(pil.size)) if max_side else 1.0
     if scale < 1:
         pil = pil.resize((round(pil.width * scale), round(pil.height * scale)), Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
@@ -183,6 +184,21 @@ ANALYSIS_SCHEMA = {
     },
 }
 
+ASTRA_ANALYSIS_SCHEMA = json.loads(json.dumps(ANALYSIS_SCHEMA))
+ASTRA_ANALYSIS_SCHEMA["required"].extend(["left_outsole", "right_outsole"])
+for outline_key in ("left_outsole", "right_outsole"):
+    ASTRA_ANALYSIS_SCHEMA["properties"][outline_key] = {
+        "type": "array", "minItems": 8, "maxItems": 40,
+        "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["x", "y"],
+            "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "y": {"type": "integer", "minimum": 0, "maximum": 1000},
+            },
+        },
+    }
+
 ASSESSMENT_PROMPT = """Map visible Hoka Gaviota 5 outsole wear at high spatial precision. The first image is an UNWORN GAVIOTA 5 STRUCTURAL REFERENCE. Its colourway, lighting, scale and rotation are irrelevant. Use only its manufactured geometry: rubber-pad outlines, grooves, ribs, moulded lines, cut-outs and channels. After it, you receive each user's untouched full photograph followed by a tight sole crop with a light coordinate guide. Coordinates run 0..1000 within that crop: x from left to right and y from top to bottom. The rounded TOE is normally at the top and the HEEL nearest the hand at the bottom. Verify anatomy from pad geometry.
 
 First geometrically align the reference outsole to each user sole using pad outlines, channels and cut-outs—not colour. Then compare corresponding manufactured details. The governing rule is CONTINUITY OF MANUFACTURED TEXTURE. Trace the reference's man-made lines, ribs, contours, stippling and fine mould texture through every corresponding rubber pad. Where expected reference detail becomes faint, interrupted or absent in the user photo without an intentional boundary, the smooth gap is wear and must be highlighted. Confirm with neighbouring texture and the matching shoe. Inspect the TOE PAD and HEEL PAD separately; these high-contact areas must not be skipped. Mark the full smooth interruption, not merely its boundary.
@@ -218,6 +234,16 @@ Inspect every contact pad from the toe to the heel. Pay particular attention to 
 For each shoe, return organic polygons around all visually supported worn patches. Coordinates are 0..1000 within that shoe's clean tight crop: x is left-to-right and y is top-to-bottom. Keep every polygon inside one continuous raised rubber contact surface and split it at pad boundaries. Intensity 1 is subtle smoothing, 2 is clear texture loss and 3 is severe flattening or material loss. Prefer complete coverage of genuine smooth patches over a few token marks, but do not paint intact tread.
 
 The accompanying full photographs provide context only. Base coordinates on the clean tight crops. Set usable=false only if the photographs genuinely prevent inspection. Confidence measures the visibility of wear evidence. Do not diagnose gait or make medical claims."""
+
+ASTRA_WEAR_PROMPT = """Analyse the two original shoe photographs directly. Do not assume that the shoe fills the frame.
+
+First locate the COMPLETE visible ground-facing outsole in each photograph, from the furthest toe edge to the furthest heel edge. Return left_outsole and right_outsole as perimeter polygons in full-photograph coordinates from 0..1000. The perimeter must enclose the shoe's complete outsole, but not the hand, background or upper.
+
+Then inspect only the raised ground-contacting rubber inside that outsole. Worn rubber is where manufactured surface detail has been abraded away: repeated ribs, grooves, stippling, mould texture or sharp lug edges that should continue have become locally smooth, polished, shallow, rounded or absent. Infer the intended pattern from neighbouring and repeated structures on the same shoe and comparison with the matching shoe. Colour is irrelevant. Crisp man-made contours are intact tread, not wear.
+
+Return organic wear polygons in full-photograph coordinates from 0..1000. Every wear polygon must remain on one raised rubber contact surface. Do not mark or cross foam, recessed channels, flex grooves, holes, cut-outs, logos, dirt, glare, shadows, the hand or background. Inspect every contact area from toe through forefoot and midfoot to the complete heel. Broad smooth toe or heel rubber is wear when surrounding texture proves that manufactured detail has disappeared, even if a few deep grooves remain.
+
+Intensity 1 means subtle smoothing, 2 clear texture loss and 3 severe flattening or material loss. Include all visually supported wear rather than a few representative marks. Set usable=false only when the photographs genuinely prevent inspection. Do not diagnose gait or make medical claims."""
 
 DIRECT_HEATMAP_PROMPT = """Edit this exact shoe-sole photograph into a diagnostic wear-overlay image.
 
@@ -283,7 +309,7 @@ def analysis_crop_data_url(img: np.ndarray, box, with_grid: bool = False) -> str
     return "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode()
 
 
-def request_assessment(content, model: str = None, reasoning_effort: str = "medium") -> Dict:
+def request_assessment(content, model: str = None, reasoning_effort: str = "medium", schema=None) -> Dict:
     if not OPENAI_API_KEY:
         raise RuntimeError("The visual assessment service is not configured")
     payload = {
@@ -296,7 +322,7 @@ def request_assessment(content, model: str = None, reasoning_effort: str = "medi
                 "type": "json_schema",
                 "name": "shoe_wear_patches",
                 "strict": True,
-                "schema": ANALYSIS_SCHEMA,
+                "schema": schema or ANALYSIS_SCHEMA,
             }
         },
         "max_output_tokens": 18000,
@@ -305,7 +331,7 @@ def request_assessment(content, model: str = None, reasoning_effort: str = "medi
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
         json=payload,
-        timeout=150,
+        timeout=300,
     )
     if response.status_code >= 400:
         detail = response.json().get("error", {}).get("message", "Visual assessment request failed")
@@ -362,6 +388,23 @@ def assess_zones_v2(left_original: str, left_crop: str, right_original: str, rig
     return request_assessment(content, model=OPENAI_VISION_MODEL, reasoning_effort="high")
 
 
+def assess_zones_astra(left_original: str, right_original: str) -> Dict:
+    """One-pass outsole location and wear interpretation on uncropped originals."""
+    content = [
+        {"type": "input_text", "text": ASTRA_WEAR_PROMPT},
+        {"type": "input_text", "text": "LEFT SHOE — ORIGINAL FULL PHOTOGRAPH"},
+        {"type": "input_image", "image_url": left_original, "detail": "original"},
+        {"type": "input_text", "text": "RIGHT SHOE — ORIGINAL FULL PHOTOGRAPH"},
+        {"type": "input_image", "image_url": right_original, "detail": "original"},
+    ]
+    return request_assessment(
+        content,
+        model=OPENAI_ASTRA_MODEL,
+        reasoning_effort="max",
+        schema=ASTRA_ANALYSIS_SCHEMA,
+    )
+
+
 def sole_mask(img: np.ndarray, box):
     h, w = img.shape[:2]
     x1, y1, x2, y2 = box
@@ -383,7 +426,7 @@ def sole_mask(img: np.ndarray, box):
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
-def overlay_heatmap(img: np.ndarray, box, regions):
+def overlay_heatmap(img: np.ndarray, box, regions, sole_outline=None):
     h, w = img.shape[:2]
     x1, y1, x2, y2 = box
     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
@@ -411,7 +454,16 @@ def overlay_heatmap(img: np.ndarray, box, regions):
     # Feather the sole boundary too. Multiplying a blurred heat region by the old
     # binary mask produced an artificial straight cutoff when segmentation ended
     # just before a rounded toe or heel.
-    mask = sole_mask(img, box)
+    if sole_outline and len(sole_outline) >= 3:
+        outline = np.asarray([
+            [x1 + round(float(point["x"]) * box_w / 1000),
+             y1 + round(float(point["y"]) * box_h / 1000)]
+            for point in sole_outline
+        ], dtype=np.int32)
+        mask = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(mask, [outline], 255, cv2.LINE_AA)
+    else:
+        mask = sole_mask(img, box)
     edge_pad = max(9, round(min(box_w, box_h) * 0.025))
     if edge_pad % 2 == 0:
         edge_pad += 1
@@ -514,6 +566,40 @@ async def analyze_v2(left: UploadFile = File(...), right: UploadFile = File(...)
             "quality": {
                 "left": {"crop_method": left_method, "detection_confidence": left_detection},
                 "right": {"crop_method": right_method, "detection_confidence": right_detection},
+            },
+        }
+    except Exception as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=500)
+
+
+@app.post("/analyze-astra")
+async def analyze_astra(left: UploadFile = File(...), right: UploadFile = File(...)):
+    """Uncropped one-pass Astra test with no detector, grid, examples or references."""
+    try:
+        left_jpeg, left_img = prepare_image(await left.read(), max_side=0)
+        right_jpeg, right_img = prepare_image(await right.read(), max_side=0)
+        assessment = assess_zones_astra(image_data_url(left_jpeg), image_data_url(right_jpeg))
+        if not assessment["usable"]:
+            return JSONResponse({
+                "detail": "These photographs do not show enough reliable tread detail for an assessment.",
+                "assessment": assessment,
+                "model": OPENAI_ASTRA_MODEL,
+            }, status_code=422)
+        left_box = (0, 0, left_img.shape[1], left_img.shape[0])
+        right_box = (0, 0, right_img.shape[1], right_img.shape[0])
+        return {
+            "left_heatmap_data_url": overlay_heatmap(
+                left_img, left_box, assessment["left_regions"], assessment["left_outsole"]
+            ),
+            "right_heatmap_data_url": overlay_heatmap(
+                right_img, right_box, assessment["right_regions"], assessment["right_outsole"]
+            ),
+            "assessment": assessment,
+            "model": OPENAI_ASTRA_MODEL,
+            "experimental": True,
+            "quality": {
+                "left": {"crop_method": "astra_full_image"},
+                "right": {"crop_method": "astra_full_image"},
             },
         }
     except Exception as exc:
