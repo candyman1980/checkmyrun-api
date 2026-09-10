@@ -273,7 +273,7 @@ def request_direct_heatmap(jpeg: bytes) -> str:
             "output_compression": "82",
         },
         files=[("image[]", ("sole.jpg", jpeg, "image/jpeg"))],
-        timeout=300,
+        timeout=600,
     )
     if response.status_code >= 400:
         try:
@@ -400,7 +400,7 @@ def assess_zones_astra(left_original: str, right_original: str) -> Dict:
     return request_assessment(
         content,
         model=OPENAI_ASTRA_MODEL,
-        reasoning_effort="max",
+        reasoning_effort="high",
         schema=ASTRA_ANALYSIS_SCHEMA,
     )
 
